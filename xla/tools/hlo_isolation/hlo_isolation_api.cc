@@ -31,11 +31,13 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/flags/commandlineflag.h"
 #include "absl/flags/reflection.h"
+#include "absl/functional/function_ref.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -383,11 +385,13 @@ struct SubnormalFlushReport {
 };
 
 // Scans every array leaf of `expected` against `actual`. For each leaf with a
-// flushed subnormal, invokes `callback` with the flush mask so the caller can
-// record bounding boxes for exactly those elements.
+// flushed subnormal where `should_check_leaf(shape_index)` is true, invokes
+// `callback` with the flush mask so the caller can record bounding boxes for
+// exactly those elements.
 void DetectSubnormalFlushInLiteral(
     const LiteralSlice& expected, const LiteralSlice& actual,
     const literal_comparison::MiscompareCallback& callback,
+    absl::FunctionRef<bool(const ShapeIndex&)> should_check_leaf,
     const ShapeIndex& shape_index, SubnormalFlushReport& report) {
   if (expected.shape().IsTuple() && actual.shape().IsTuple()) {
     const int64_t count = std::min(expected.shape().tuple_shapes().size(),
@@ -397,11 +401,12 @@ void DetectSubnormalFlushInLiteral(
       next_index.push_back(i);
       DetectSubnormalFlushInLiteral(LiteralSlice(expected, {i}),
                                     LiteralSlice(actual, {i}), callback,
-                                    next_index, report);
+                                    should_check_leaf, next_index, report);
     }
     return;
   }
-  if (!expected.shape().IsArray() || !actual.shape().IsArray() ||
+  if (!should_check_leaf(shape_index) || !expected.shape().IsArray() ||
+      !actual.shape().IsArray() ||
       expected.shape().element_type() != actual.shape().element_type() ||
       !ShapeUtil::SameDimensions(expected.shape(), actual.shape())) {
     return;
@@ -448,10 +453,11 @@ void DetectSubnormalFlushInLiteral(
 // nullopt when nothing was flushed.
 std::optional<SubnormalFlushReport> DetectSubnormalFlushInLiteral(
     const LiteralSlice& expected, const LiteralSlice& actual,
-    const literal_comparison::MiscompareCallback& callback = nullptr) {
+    const literal_comparison::MiscompareCallback& callback,
+    absl::FunctionRef<bool(const ShapeIndex&)> should_check_leaf) {
   SubnormalFlushReport report;
-  DetectSubnormalFlushInLiteral(expected, actual, callback, ShapeIndex(),
-                                report);
+  DetectSubnormalFlushInLiteral(expected, actual, callback, should_check_leaf,
+                                ShapeIndex(), report);
   if (report.mismatches.empty()) {
     return std::nullopt;
   }
@@ -468,11 +474,13 @@ absl::Status NearWithSubnormalFlushCheck(
     const LiteralSlice& expected, const LiteralSlice& actual,
     const ErrorSpec& error_spec,
     const literal_comparison::MiscompareCallback& callback,
-    std::vector<NumericMismatch>& flush_mismatches) {
+    std::vector<NumericMismatch>& flush_mismatches,
+    absl::FunctionRef<bool(const ShapeIndex&)> should_check_leaf =
+        [](const ShapeIndex&) { return true; }) {
   absl::Status status = literal_comparison::Near(
       expected, actual, error_spec, /*detailed_message=*/true, callback);
   std::optional<SubnormalFlushReport> report = DetectSubnormalFlushInLiteral(
-      expected, actual, status.ok() ? callback : nullptr);
+      expected, actual, status.ok() ? callback : nullptr, should_check_leaf);
   if (!report.has_value()) {
     return status;
   }
@@ -520,6 +528,177 @@ bool InputsContainSubnormal(absl::Span<const Literal> inputs) {
     }
   }
   return false;
+}
+
+bool IsBitPreservingOp(const HloInstruction& instr) {
+  switch (instr.opcode()) {
+    case HloOpcode::kAllGather:
+    case HloOpcode::kAllGatherDone:
+    case HloOpcode::kAllGatherStart:
+    case HloOpcode::kAllToAll:
+    case HloOpcode::kBitcast:
+    case HloOpcode::kBitcastConvert:
+    case HloOpcode::kBroadcast:
+    case HloOpcode::kCollectiveBroadcast:
+    case HloOpcode::kCollectivePermute:
+    case HloOpcode::kCollectivePermuteDone:
+    case HloOpcode::kCollectivePermuteStart:
+    case HloOpcode::kConcatenate:
+    case HloOpcode::kConstant:
+    case HloOpcode::kCopy:
+    case HloOpcode::kCopyDone:
+    case HloOpcode::kCopyStart:
+    case HloOpcode::kDynamicSlice:
+    case HloOpcode::kDynamicUpdateSlice:
+    case HloOpcode::kGather:
+    case HloOpcode::kGetTupleElement:
+    case HloOpcode::kIota:
+    case HloOpcode::kOptimizationBarrier:
+    case HloOpcode::kPad:
+    case HloOpcode::kParameter:
+    case HloOpcode::kPartitionId:
+    case HloOpcode::kRecv:
+    case HloOpcode::kRecvDone:
+    case HloOpcode::kReplicaId:
+    case HloOpcode::kReshape:
+    case HloOpcode::kReverse:
+    case HloOpcode::kSelect:
+    case HloOpcode::kSend:
+    case HloOpcode::kSendDone:
+    case HloOpcode::kSlice:
+    case HloOpcode::kTranspose:
+    case HloOpcode::kTuple:
+      return true;
+    case HloOpcode::kFusion:
+      return absl::c_all_of(
+          instr.fused_instructions_computation()->instructions(),
+          [](const HloInstruction* fused) {
+            return IsBitPreservingOp(*fused);
+          });
+    default:
+      return false;
+  }
+}
+
+bool IsIndexOrPredicateOperand(HloOpcode opcode, int64_t operand_idx) {
+  switch (opcode) {
+    case HloOpcode::kSelect:
+      return operand_idx == 0;
+    case HloOpcode::kGather:
+      return operand_idx == 1;
+    case HloOpcode::kDynamicSlice:
+      return operand_idx >= 1;
+    case HloOpcode::kDynamicUpdateSlice:
+      return operand_idx >= 2;
+    default:
+      return false;
+  }
+}
+
+bool IsBitPreservingOutputChain(
+    const HloInstruction* instr, absl::Span<const int64_t> shape_index,
+    std::vector<const HloInstruction*>& call_stack,
+    absl::flat_hash_set<const HloInstruction*>& visited) {
+  if (instr == nullptr) {
+    return false;
+  }
+  if (instr->opcode() == HloOpcode::kTuple && !shape_index.empty()) {
+    const int64_t idx = shape_index.front();
+    if (idx < 0 || idx >= instr->operand_count()) {
+      return false;
+    }
+    return IsBitPreservingOutputChain(
+        instr->operand(idx), shape_index.subspan(1), call_stack, visited);
+  }
+  if (instr->opcode() == HloOpcode::kGetTupleElement) {
+    std::vector<int64_t> next_index = {instr->tuple_index()};
+    next_index.insert(next_index.end(), shape_index.begin(), shape_index.end());
+    return IsBitPreservingOutputChain(instr->operand(0), next_index, call_stack,
+                                      visited);
+  }
+  if (instr->opcode() == HloOpcode::kFusion) {
+    call_stack.push_back(instr);
+    const bool ok = IsBitPreservingOutputChain(
+        instr->fused_expression_root(), shape_index, call_stack, visited);
+    call_stack.pop_back();
+    return ok;
+  }
+  if (instr->opcode() == HloOpcode::kCall) {
+    call_stack.push_back(instr);
+    const bool ok =
+        IsBitPreservingOutputChain(instr->to_apply()->root_instruction(),
+                                   shape_index, call_stack, visited);
+    call_stack.pop_back();
+    return ok;
+  }
+  if (instr->opcode() == HloOpcode::kAsyncDone ||
+      instr->opcode() == HloOpcode::kAsyncUpdate ||
+      instr->opcode() == HloOpcode::kOptimizationBarrier) {
+    return IsBitPreservingOutputChain(instr->operand(0), shape_index,
+                                      call_stack, visited);
+  }
+  if (instr->opcode() == HloOpcode::kAsyncStart) {
+    call_stack.push_back(instr);
+    const bool ok = IsBitPreservingOutputChain(
+        instr->async_wrapped_instruction(), shape_index, call_stack, visited);
+    call_stack.pop_back();
+    return ok;
+  }
+  if (instr->opcode() == HloOpcode::kParameter) {
+    if (call_stack.empty()) {
+      return true;
+    }
+    const HloInstruction* caller = call_stack.back();
+    const int64_t param_num = instr->parameter_number();
+    if (param_num < 0 || param_num >= caller->operand_count()) {
+      return false;
+    }
+    call_stack.pop_back();
+    const bool ok = IsBitPreservingOutputChain(
+        caller->operand(param_num), shape_index, call_stack, visited);
+    call_stack.push_back(caller);
+    return ok;
+  }
+  if (!IsBitPreservingOp(*instr)) {
+    return false;
+  }
+  if (shape_index.empty() && call_stack.empty() &&
+      !visited.insert(instr).second) {
+    return true;
+  }
+  for (int64_t i = 0; i < instr->operand_count(); ++i) {
+    if (IsIndexOrPredicateOperand(instr->opcode(), i)) {
+      continue;
+    }
+    if (!IsBitPreservingOutputChain(instr->operand(i), {}, call_stack,
+                                    visited)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsBitPreservingInstructionOutputAtIndex(const HloInstruction* instr,
+                                             const ShapeIndex& shape_index) {
+  if (instr == nullptr) {
+    return false;
+  }
+  std::vector<const HloInstruction*> call_stack;
+  if (instr->parent() != nullptr && instr->parent()->IsFusionComputation() &&
+      instr->parent()->FusionInstruction() != nullptr) {
+    call_stack.push_back(instr->parent()->FusionInstruction());
+  }
+  absl::flat_hash_set<const HloInstruction*> visited;
+  return IsBitPreservingOutputChain(instr, shape_index, call_stack, visited);
+}
+
+bool IsBitPreservingModuleOutputAtIndex(const HloModule& module,
+                                        const ShapeIndex& shape_index) {
+  if (!module.has_entry_computation()) {
+    return false;
+  }
+  return IsBitPreservingInstructionOutputAtIndex(
+      module.entry_computation()->root_instruction(), shape_index);
 }
 
 absl::StatusOr<Literal> CoerceActualLiteralToExpectedShape(
@@ -581,7 +760,9 @@ absl::Status CompareOutputs(const HloModule& module, const Literal& test_output,
   absl::Status status = NearWithSubnormalFlushCheck(
       reference_output, test_output, error_spec,
       MakeMiscompareCallback(std::string(literal_prefix), &computed_bboxes),
-      flush_mismatches);
+      flush_mismatches, [&](const ShapeIndex& shape_index) {
+        return IsBitPreservingModuleOutputAtIndex(module, shape_index);
+      });
   NumericCheck* numeric_check = result.add_numeric_checks();
   numeric_check->set_name(check_name);
   numeric_check->set_expected_contains_inf_or_nan(
@@ -818,95 +999,107 @@ std::vector<HloOutputCallback> CreateComparisonHloOutputCallbacks(
 
       double abs_error = options.abs_error_bound;
       double rel_error = options.rel_error_bound;
+      absl::flat_hash_set<ShapeIndex> bit_preserving_leaves;
+      ShapeUtil::ForEachSubshape(
+          instruction->shape(),
+          [&](const Shape& subshape, const ShapeIndex& index) {
+            if (subshape.IsArray() &&
+                IsBitPreservingInstructionOutputAtIndex(instruction, index)) {
+              bit_preserving_leaves.insert(index);
+            }
+          });
 
       xla::HloOutputCallback dynamic_cb;
       dynamic_cb.callback_id = hlo_id;
       dynamic_cb.num_operands = 1;
-      dynamic_cb.callback = [op_name, ref_op_name, expected_literals,
-                             record_verified,
-                             module_name = original_module.name(), abs_error,
-                             rel_error, result_mutex, test_result](
-                                int64_t replica_id, int64_t partition_id,
-                                absl::Span<std::shared_ptr<const Literal> const>
-                                    literals) {
-        if (literals.empty() || !literals[0]) {
-          LOG(ERROR)
-              << "HloOutputCallback called with empty or null literals for "
-                 "op "
-              << op_name << " within fusion " << module_name;
-          return;
-        }
-
-        std::shared_ptr<const Literal> expected_literal_ptr;
-        if (expected_literals != nullptr) {
-          absl::MutexLock lock(*result_mutex);
-          auto it = expected_literals->find(ref_op_name);
-          if (it != expected_literals->end()) {
-            expected_literal_ptr = it->second;
-            expected_literals->erase(it);
-          }
-        }
-
-        if (expected_literal_ptr == nullptr) {
-          LOG(WARNING) << "No reference literal found in memory for op "
-                       << ref_op_name << " within fusion " << module_name;
-          return;
-        }
-
-        Literal expected_literal = expected_literal_ptr->Clone();
-        absl::StatusOr<Literal> actual_literal_or =
-            CoerceActualLiteralToExpectedShape(*literals[0],
-                                               expected_literal.shape());
-        if (!actual_literal_or.ok()) {
-          LOG(WARNING) << actual_literal_or.status().message() << " for op "
-                       << op_name << " within fusion " << module_name;
-          return;
-        }
-        const Literal& actual_literal = *actual_literal_or;
-
-        absl::flat_hash_map<int64_t, numerics::debug_info::MismatchBoundingBox>
-            computed_bboxes;
-        xla::ErrorSpec error_spec(static_cast<float>(abs_error),
-                                  static_cast<float>(rel_error));
-        std::vector<NumericMismatch> flush_mismatches;
-        absl::Status matched = NearWithSubnormalFlushCheck(
-            expected_literal, actual_literal, error_spec,
-            MakeMiscompareCallback(absl::StrCat(module_name, "-", op_name),
-                                   &computed_bboxes),
-            flush_mismatches);
-
-        if (!matched.ok()) {
-          std::string error_message = absl::StrFormat(
-              "FusionDebugger: Mismatch found in op \"%s\" within fusion "
-              "\"%s\"\n%s",
-              op_name, module_name, matched.message());
-          ADD_FAILURE() << error_message;
-          LOG(ERROR) << error_message;
-
-          absl::MutexLock lock(*result_mutex);
-          NumericCheck* numeric_check = test_result->add_numeric_checks();
-          numeric_check->set_name(absl::StrCat("FusionDebugger:", op_name));
-          numeric_check->set_expected_contains_inf_or_nan(
-              LiteralContainsInfOrNan(expected_literal));
-          numeric_check->set_actual_contains_inf_or_nan(
-              LiteralContainsInfOrNan(actual_literal));
-
-          absl::StatusOr<std::vector<NumericMismatch>> top_mismatches =
-              flush_mismatches.empty()
-                  ? ExtractTopMismatches(std::string(matched.message()),
-                                         actual_literal.shape().IsTuple())
-                  : std::move(flush_mismatches);
-          if (top_mismatches.ok()) {
-            for (NumericMismatch& mismatch : *top_mismatches) {
-              ApplyBoundingBoxToMismatch(computed_bboxes, mismatch);
+      dynamic_cb.callback =
+          [op_name, ref_op_name, expected_literals, record_verified,
+           module_name = original_module.name(), abs_error, rel_error,
+           bit_preserving_leaves = std::move(bit_preserving_leaves),
+           result_mutex, test_result](
+              int64_t replica_id, int64_t partition_id,
+              absl::Span<std::shared_ptr<const Literal> const> literals) {
+            if (literals.empty() || !literals[0]) {
+              LOG(ERROR)
+                  << "HloOutputCallback called with empty or null literals for "
+                     "op "
+                  << op_name << " within fusion " << module_name;
+              return;
             }
-          }
-          PopulateNumericCheckMismatches(numeric_check, top_mismatches);
-        } else if (record_verified) {
-          absl::MutexLock lock(*result_mutex);
-          test_result->add_verified_instructions(op_name);
-        }
-      };
+
+            std::shared_ptr<const Literal> expected_literal_ptr;
+            if (expected_literals != nullptr) {
+              absl::MutexLock lock(*result_mutex);
+              auto it = expected_literals->find(ref_op_name);
+              if (it != expected_literals->end()) {
+                expected_literal_ptr = it->second;
+                expected_literals->erase(it);
+              }
+            }
+
+            if (expected_literal_ptr == nullptr) {
+              LOG(WARNING) << "No reference literal found in memory for op "
+                           << ref_op_name << " within fusion " << module_name;
+              return;
+            }
+
+            Literal expected_literal = expected_literal_ptr->Clone();
+            absl::StatusOr<Literal> actual_literal_or =
+                CoerceActualLiteralToExpectedShape(*literals[0],
+                                                   expected_literal.shape());
+            if (!actual_literal_or.ok()) {
+              LOG(WARNING) << actual_literal_or.status().message() << " for op "
+                           << op_name << " within fusion " << module_name;
+              return;
+            }
+            const Literal& actual_literal = *actual_literal_or;
+
+            absl::flat_hash_map<int64_t,
+                                numerics::debug_info::MismatchBoundingBox>
+                computed_bboxes;
+            xla::ErrorSpec error_spec(static_cast<float>(abs_error),
+                                      static_cast<float>(rel_error));
+            std::vector<NumericMismatch> flush_mismatches;
+            absl::Status matched = NearWithSubnormalFlushCheck(
+                expected_literal, actual_literal, error_spec,
+                MakeMiscompareCallback(absl::StrCat(module_name, "-", op_name),
+                                       &computed_bboxes),
+                flush_mismatches, [&](const ShapeIndex& idx) {
+                  return bit_preserving_leaves.contains(idx);
+                });
+
+            if (!matched.ok()) {
+              std::string error_message = absl::StrFormat(
+                  "FusionDebugger: Mismatch found in op \"%s\" within fusion "
+                  "\"%s\"\n%s",
+                  op_name, module_name, matched.message());
+              ADD_FAILURE() << error_message;
+              LOG(ERROR) << error_message;
+
+              absl::MutexLock lock(*result_mutex);
+              NumericCheck* numeric_check = test_result->add_numeric_checks();
+              numeric_check->set_name(absl::StrCat("FusionDebugger:", op_name));
+              numeric_check->set_expected_contains_inf_or_nan(
+                  LiteralContainsInfOrNan(expected_literal));
+              numeric_check->set_actual_contains_inf_or_nan(
+                  LiteralContainsInfOrNan(actual_literal));
+
+              absl::StatusOr<std::vector<NumericMismatch>> top_mismatches =
+                  flush_mismatches.empty()
+                      ? ExtractTopMismatches(std::string(matched.message()),
+                                             actual_literal.shape().IsTuple())
+                      : std::move(flush_mismatches);
+              if (top_mismatches.ok()) {
+                for (NumericMismatch& mismatch : *top_mismatches) {
+                  ApplyBoundingBoxToMismatch(computed_bboxes, mismatch);
+                }
+              }
+              PopulateNumericCheckMismatches(numeric_check, top_mismatches);
+            } else if (record_verified) {
+              absl::MutexLock lock(*result_mutex);
+              test_result->add_verified_instructions(op_name);
+            }
+          };
 
       dynamic_cbs.push_back(std::move(dynamic_cb));
     }
@@ -1122,8 +1315,18 @@ absl::StatusOr<HloIsolationTestResult> RunIsolationTestOnModule(
   // The backend may flush subnormals to zero in both the fused and the
   // defused run, so a matching stage 1 proves nothing about subnormal inputs.
   // Only skip the stage 1 short circuit when a reference will actually run.
-  const bool inputs_have_subnormals =
-      reference_runner != nullptr && InputsContainSubnormal(input_data);
+  const bool has_bit_preserving_op =
+      absl::c_any_of(module.computations(), [](const HloComputation* comp) {
+        return absl::c_any_of(
+            comp->instructions(), [](const HloInstruction* instr) {
+              return !instr->IsConstant() &&
+                     instr->opcode() != HloOpcode::kParameter &&
+                     IsBitPreservingOp(*instr);
+            });
+      });
+  const bool inputs_have_subnormals = has_bit_preserving_op &&
+                                      reference_runner != nullptr &&
+                                      InputsContainSubnormal(input_data);
   if (defused_output.ok()) {
     // Compare Test vs Defused Test.
     absl::Status compare_status =

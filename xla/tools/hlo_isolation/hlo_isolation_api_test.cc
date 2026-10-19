@@ -451,7 +451,7 @@ TEST(HloIsolationApiTest, SubnormalFlushToZeroTrappedUnderDefaultTolerance) {
 HloModule subnormal_flush
 ENTRY main {
   p0 = f32[4] parameter(0)
-  ROOT add = f32[4] add(p0, p0)
+  ROOT copy = f32[4] copy(p0)
 }
 )hlo";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
@@ -464,8 +464,9 @@ ENTRY main {
 
   ModuleIsolationOptions options;
   // Both fused and defused device runs flush the subnormal to 0.0f, while the
-  // interpreter reference preserves 2 * denorm_min(). Even under the default
-  // tolerance (abs=0.01, rel=0.1), the subnormal flush to zero must fail. The
+  // interpreter reference preserves denorm_min(). On a bit-preserving op such
+  // as `copy`, even under the default tolerance (abs=0.01, rel=0.1) and default
+  // `trap_subnormal_flush=false`, the subnormal flush to zero must fail. The
   // normal elements differ by rounding noise that the tolerance accepts and
   // must not be counted as mismatches.
   options.run_module_fn =
@@ -474,11 +475,10 @@ ENTRY main {
           absl::Span<const Literal> i,
           const RunModuleOptions& run_opts) -> absl::StatusOr<Literal> {
     if (r == FakeReferenceRunner()) {
-      const float expected = subnormal_f32 * 2.0f;
-      Literal ref =
-          LiteralUtil::CreateR1<float>({expected, 2.0f, expected, 2.0f});
+      Literal ref = LiteralUtil::CreateR1<float>(
+          {subnormal_f32, 2.0f, subnormal_f32, 2.0f});
       if (run_opts.expected_literals != nullptr) {
-        (*run_opts.expected_literals)["add"] =
+        (*run_opts.expected_literals)["copy"] =
             std::make_shared<Literal>(ref.Clone());
       }
       return ref;
@@ -528,7 +528,7 @@ ENTRY main {
     ++flush_checks;
     ASSERT_EQ(check.top_mismatches_size(), 1) << check.name();
     const NumericMismatch& mismatch = check.top_mismatches(0);
-    EXPECT_DOUBLE_EQ(mismatch.expected(), subnormal_f32 * 2.0f) << check.name();
+    EXPECT_DOUBLE_EQ(mismatch.expected(), subnormal_f32) << check.name();
     EXPECT_DOUBLE_EQ(mismatch.actual(), 0.0) << check.name();
     EXPECT_EQ(mismatch.mismatch_count(), 2) << check.name();
     EXPECT_EQ(mismatch.total_elements(), 4) << check.name();
@@ -594,7 +594,7 @@ TEST(HloIsolationApiTest, SubnormalFlushRespectsNonDefaultLayouts) {
 HloModule subnormal_layout_test
 ENTRY main {
   p0 = f32[2,2]{0,1} parameter(0)
-  ROOT add = f32[2,2]{0,1} add(p0, p0)
+  ROOT copy = f32[2,2]{0,1} copy(p0)
 }
 )hlo";
   ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
@@ -921,6 +921,226 @@ ENTRY main {
   r = f32[8] rng(zero, one), distribution=rng_uniform
   ROOT add = f32[8] add(x, r))"));
   EXPECT_EQ(rng, "CONTAINS_RNG");
+}
+
+TEST(HloIsolationApiTest, SubnormalFlushScopedToBitPreservingOutputLeaves) {
+  const absl::string_view kComputeHlo = R"hlo(
+HloModule subnormal_flush_compute_op
+ENTRY main {
+  p0 = f32[4] parameter(0)
+  add = f32[4] add(p0, p0)
+  ROOT out = f32[4] copy(add)
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> compute_module,
+                       xla::ParseAndReturnUnverifiedModule(kComputeHlo));
+
+  const float subnormal_f32 = std::numeric_limits<float>::denorm_min();
+  std::vector<Literal> inputs;
+  inputs.push_back(
+      LiteralUtil::CreateR1<float>({subnormal_f32, 1.0f, subnormal_f32, 1.0f}));
+
+  ModuleIsolationOptions options;
+  options.run_module_fn =
+      [subnormal_f32](
+          std::unique_ptr<HloModule> m, HloRunnerInterface* r,
+          absl::Span<const Literal> i,
+          const RunModuleOptions& run_opts) -> absl::StatusOr<Literal> {
+    if (r == FakeReferenceRunner()) {
+      const float expected = subnormal_f32 * 2.0f;
+      return LiteralUtil::CreateR1<float>({expected, 2.0f, expected, 2.0f});
+    }
+    if (absl::StrContains(m->name(), "defused")) {
+      return LiteralUtil::CreateR1<float>({0.0f, 3.0f, 0.0f, 2.0f});
+    }
+    return LiteralUtil::CreateR1<float>({0.0f, 2.0f, 0.0f, 2.0f});
+  };
+  int mismatch_reports = 0;
+  options.on_mismatch_fn = [&](const HloModule&, const Literal&, const Literal&,
+                               const absl::Status&) { ++mismatch_reports; };
+
+  // A compute op (`add`), even wrapped in `copy`, does not report a
+  // false-positive subnormal flush mismatch.
+  ASSERT_OK_AND_ASSIGN(
+      HloIsolationTestResult result,
+      RunIsolationTestOnModule(*compute_module, nullptr, FakeReferenceRunner(),
+                               options, inputs));
+  EXPECT_EQ(result.state(), State::SUCCESS);
+  EXPECT_EQ(result.reason(), "STAGE_2_INTERPRETER_SUCCESS");
+  EXPECT_EQ(mismatch_reports, 0);
+
+  // On a mixed multi-output fusion (`tuple(reshape(copy(p0)), add(p0, p0))`),
+  // a flushed subnormal on the bit-preserving leaf `{0}` is trapped even when
+  // Stage 1 matches.
+  const absl::string_view kMixedFusionHlo = R"hlo(
+HloModule mixed_multi_output_fusion
+fused_comp {
+  p = f32[4] parameter(0)
+  c = f32[4] copy(p)
+  r = f32[4] reshape(c)
+  a = f32[4] add(p, p)
+  ROOT t = (f32[4], f32[4]) tuple(r, a)
+}
+ENTRY main {
+  p0 = f32[4] parameter(0)
+  ROOT f = (f32[4], f32[4]) fusion(p0), kind=kLoop, calls=fused_comp
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> mixed_module,
+                       xla::ParseAndReturnUnverifiedModule(kMixedFusionHlo));
+  options.run_module_fn =
+      [subnormal_f32](
+          std::unique_ptr<HloModule> m, HloRunnerInterface* r,
+          absl::Span<const Literal> i,
+          const RunModuleOptions& run_opts) -> absl::StatusOr<Literal> {
+    if (r == FakeReferenceRunner()) {
+      Literal leaf0 = LiteralUtil::CreateR1<float>(
+          {subnormal_f32, 1.0f, subnormal_f32, 1.0f});
+      Literal leaf1 = LiteralUtil::CreateR1<float>({0.0f, 2.0f, 0.0f, 2.0f});
+      return LiteralUtil::MakeTuple({&leaf0, &leaf1});
+    }
+    Literal leaf0 = LiteralUtil::CreateR1<float>({0.0f, 1.0f, 0.0f, 1.0f});
+    Literal leaf1 = LiteralUtil::CreateR1<float>({0.0f, 2.0f, 0.0f, 2.0f});
+    return LiteralUtil::MakeTuple({&leaf0, &leaf1});
+  };
+  ASSERT_OK_AND_ASSIGN(
+      result, RunIsolationTestOnModule(*mixed_module, nullptr,
+                                       FakeReferenceRunner(), options, inputs));
+  EXPECT_EQ(result.state(), State::FAILURE);
+  EXPECT_EQ(result.reason(), "NUMERIC_MISMATCH");
+  EXPECT_EQ(mismatch_reports, 1);
+
+  // Tuple element forwarded through `optimization-barrier` preserves its
+  // `shape_index`, so leaf 0 (`p0`) still traps flushes despite sibling `add`.
+  const absl::string_view kOptBarrierHlo = R"hlo(
+HloModule opt_barrier_tuple
+ENTRY main {
+  p0 = f32[4] parameter(0)
+  a = f32[4] add(p0, p0)
+  t = (f32[4], f32[4]) tuple(p0, a)
+  ob = (f32[4], f32[4]) opt-barrier(t)
+  ROOT gte = f32[4] get-tuple-element(ob), index=0
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> opt_barrier_module,
+                       xla::ParseAndReturnUnverifiedModule(kOptBarrierHlo));
+  options.enable_fusion_debugger = false;
+  options.run_module_fn =
+      [subnormal_f32](
+          std::unique_ptr<HloModule> m, HloRunnerInterface* r,
+          absl::Span<const Literal> i,
+          const RunModuleOptions& run_opts) -> absl::StatusOr<Literal> {
+    if (r == FakeReferenceRunner()) {
+      return LiteralUtil::CreateR1<float>(
+          {subnormal_f32, 1.0f, subnormal_f32, 1.0f});
+    }
+    return LiteralUtil::CreateR1<float>({0.0f, 1.0f, 0.0f, 1.0f});
+  };
+  ASSERT_OK_AND_ASSIGN(
+      result, RunIsolationTestOnModule(*opt_barrier_module, nullptr,
+                                       FakeReferenceRunner(), options, inputs));
+  EXPECT_EQ(result.state(), State::FAILURE);
+  EXPECT_EQ(result.reason(), "NUMERIC_MISMATCH");
+
+  // Shared callee called once with `p0` and once with `add(p0, p0)` is not
+  // misclassified as bit-preserving, nor is `bitcast-convert(u32, add)`.
+  for (absl::string_view hlo : {
+           absl::string_view(R"hlo(
+HloModule shared_callee
+%callee (x: f32[4]) -> f32[4] {
+  %x = f32[4] parameter(0)
+  ROOT %copy = f32[4] copy(%x)
+}
+ENTRY main {
+  %p0 = f32[4] parameter(0)
+  %c1 = f32[4] call(%p0), to_apply=%callee
+  %a = f32[4] add(%p0, %p0)
+  %c2 = f32[4] call(%a), to_apply=%callee
+  ROOT %out = f32[8] concatenate(%c1, %c2), dimensions={0}
+}
+)hlo"),
+           absl::string_view(R"hlo(
+HloModule bitcast_convert_through_u32
+ENTRY main {
+  %p0 = f32[4] parameter(0)
+  %a = f32[4] add(%p0, %p0)
+  %as_u32 = u32[4] bitcast-convert(%a)
+  ROOT %out = f32[4] bitcast-convert(%as_u32)
+}
+)hlo"),
+       }) {
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> mod,
+                         xla::ParseAndReturnUnverifiedModule(hlo));
+    const bool is_concat = mod->name() == "shared_callee";
+    options.run_module_fn =
+        [subnormal_f32, is_concat](
+            std::unique_ptr<HloModule> m, HloRunnerInterface* r,
+            absl::Span<const Literal> i,
+            const RunModuleOptions& run_opts) -> absl::StatusOr<Literal> {
+      const float two_sub = subnormal_f32 * 2.0f;
+      if (is_concat) {
+        if (r == FakeReferenceRunner()) {
+          return LiteralUtil::CreateR1<float>({subnormal_f32, 1.0f,
+                                               subnormal_f32, 1.0f, two_sub,
+                                               2.0f, two_sub, 2.0f});
+        }
+        return LiteralUtil::CreateR1<float>(
+            {subnormal_f32, 1.0f, subnormal_f32, 1.0f, 0.0f, 2.0f, 0.0f, 2.0f});
+      }
+      if (r == FakeReferenceRunner()) {
+        return LiteralUtil::CreateR1<float>({two_sub, 2.0f, two_sub, 2.0f});
+      }
+      return LiteralUtil::CreateR1<float>({0.0f, 2.0f, 0.0f, 2.0f});
+    };
+    ASSERT_OK_AND_ASSIGN(
+        result, RunIsolationTestOnModule(*mod, nullptr, FakeReferenceRunner(),
+                                         options, inputs));
+    EXPECT_EQ(result.state(), State::SUCCESS) << mod->name();
+    EXPECT_EQ(result.reason(), "STAGE_2_INTERPRETER_SUCCESS") << mod->name();
+  }
+
+  // FusionDebugger callback on a compute-fed `copy` does not falsely trap.
+  const absl::string_view kFusionCopyOfAddHlo = R"hlo(
+HloModule fusion_copy_of_add
+%fused_comp (p: f32[4]) -> f32[4] {
+  %p = f32[4] parameter(0)
+  %a = f32[4] add(%p, %p)
+  ROOT %copy = f32[4] copy(%a)
+}
+ENTRY main {
+  %p0 = f32[4] parameter(0)
+  ROOT %f = f32[4] fusion(%p0), kind=kLoop, calls=%fused_comp
+}
+)hlo";
+  ASSERT_OK_AND_ASSIGN(
+      std::unique_ptr<HloModule> fusion_copy_module,
+      xla::ParseAndReturnUnverifiedModule(kFusionCopyOfAddHlo));
+  auto clone = fusion_copy_module->Clone();
+  absl::flat_hash_map<GroupKey, std::vector<std::string>> ref_groups = {
+      {{HloOpcode::kCopy, "f32[4]"}, {"copy"}},
+  };
+  auto expected_literals = std::make_shared<ExpectedLiteralsMap>();
+  (*expected_literals)["copy"] =
+      std::make_shared<Literal>(LiteralUtil::CreateR1<float>(
+          {subnormal_f32 * 2.0f, 2.0f, subnormal_f32 * 2.0f, 2.0f}));
+  auto mutex = std::make_shared<absl::Mutex>();
+  HloIsolationTestResult cb_result;
+  std::vector<HloOutputCallback> cbs = CreateComparisonHloOutputCallbacks(
+      clone.get(), ref_groups, expected_literals, *fusion_copy_module,
+      ModuleIsolationOptions(), mutex, &cb_result);
+  auto actual = std::make_shared<Literal>(
+      LiteralUtil::CreateR1<float>({0.0f, 2.0f, 0.0f, 2.0f}));
+  ::testing::TestPartResultArray cb_failures;
+  {
+    ::testing::ScopedFakeTestPartResultReporter reporter(
+        ::testing::ScopedFakeTestPartResultReporter::INTERCEPT_ALL_THREADS,
+        &cb_failures);
+    for (const auto& cb : cbs) {
+      cb.callback(0, 0, {actual});
+    }
+  }
+  EXPECT_EQ(cb_failures.size(), 0);
+  EXPECT_EQ(cb_result.numeric_checks_size(), 0);
 }
 
 }  // namespace
