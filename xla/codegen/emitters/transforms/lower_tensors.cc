@@ -29,6 +29,7 @@ limitations under the License.
 #include "absl/log/check.h"
 #include "absl/numeric/bits.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "google/protobuf/text_format.h"
 #include "llvm/ADT/APInt.h"
@@ -841,8 +842,11 @@ std::tuple<Value, Value> GetSubByteIndex(Value linear_index, int bit_width,
   return {i8_index, sub_byte_shift};
 }
 
+constexpr absl::string_view kDsmemAttr = "xla_gpu.dsmem";
+
 ml::GEPOp CreateGep(TypedValue<mlir::RankedTensorType> tensor,
-                    Value linear_index, mlir::ImplicitLocOpBuilder& b) {
+                    Value linear_index, mlir::ImplicitLocOpBuilder& b,
+                    bool is_dsmem = false) {
   mlir::RankedTensorType tensor_type = tensor.getType();
   Type element_type = tensor_type.getElementType();
   int64_t num_elements = tensor_type.getNumElements();
@@ -855,6 +859,17 @@ ml::GEPOp CreateGep(TypedValue<mlir::RankedTensorType> tensor,
   auto ptr = ml::LLVMPointerType::get(b.getContext());
   Value tensor_ptr =
       UnrealizedConversionCastOp::create(b, ptr, tensor).getResult(0);
+  if (is_dsmem) {
+    Value num_elems_val = mlir::arith::ConstantIntOp::create(
+        b, linear_index.getType(), num_elements);
+    Value cta_rank =
+        mlir::arith::DivUIOp::create(b, linear_index, num_elems_val);
+    if (cta_rank.getType() != b.getI32Type()) {
+      cta_rank = mlir::arith::TruncIOp::create(b, b.getI32Type(), cta_rank);
+    }
+    linear_index = mlir::arith::RemUIOp::create(b, linear_index, num_elems_val);
+    tensor_ptr = gpu::DsmemPointerOp::create(b, ptr, tensor_ptr, cta_rank);
+  }
   mlir::LLVMTypeConverter converter(b.getContext());
   auto llvm_element_type = converter.convertType(element_type);
   auto array_type =
@@ -867,8 +882,9 @@ ml::GEPOp CreateGep(TypedValue<mlir::RankedTensorType> tensor,
 }
 
 ml::GEPOp CreateGep(TypedValue<mlir::RankedTensorType> tensor,
-                    ValueRange indices, mlir::ImplicitLocOpBuilder& b) {
-  return CreateGep(tensor, GetLinearIndex(indices, b), b);
+                    ValueRange indices, mlir::ImplicitLocOpBuilder& b,
+                    bool is_dsmem = false) {
+  return CreateGep(tensor, GetLinearIndex(indices, b), b, is_dsmem);
 }
 
 // Returns a tensor of the type of `tensor` backed by the buffer that `tensor`
@@ -889,8 +905,9 @@ TypedValue<mlir::RankedTensorType> ResolveAddressTensor(
 }
 
 ml::GEPOp CreateAtomicGep(TypedValue<mlir::RankedTensorType> tensor,
-                          ValueRange indices, mlir::ImplicitLocOpBuilder& b) {
-  return CreateGep(ResolveAddressTensor(tensor, b), indices, b);
+                          ValueRange indices, mlir::ImplicitLocOpBuilder& b,
+                          bool is_dsmem = false) {
+  return CreateGep(ResolveAddressTensor(tensor, b), indices, b, is_dsmem);
 }
 
 struct RewriteTensorExtract : OpRewritePattern<mlir::tensor::ExtractOp> {
@@ -909,7 +926,8 @@ struct RewriteTensorExtract : OpRewritePattern<mlir::tensor::ExtractOp> {
           GetSubByteIndex(linear_index, *sub_byte_width, b);
     }
 
-    auto gep = CreateGep(op.getTensor(), linear_index, b);
+    auto gep =
+        CreateGep(op.getTensor(), linear_index, b, op->hasAttr(kDsmemAttr));
     Type llvm_type =
         mlir::dyn_cast<ml::LLVMArrayType>(gep.getElemType()).getElementType();
     auto load_op = ml::LoadOp::create(rewriter, gep.getLoc(), llvm_type, gep);
@@ -1084,7 +1102,8 @@ class RewriteTensorInsert : public OpRewritePattern<mlir::tensor::InsertOp> {
       if (device_spec_.IsCpu()) {
         // On CPU, workgroup tiles are byte-aligned (see `GetWorkDimensions`),
         // so distinct threads never access the same byte.
-        auto gep = CreateGep(tensor_dest, linear_index, b);
+        auto gep =
+            CreateGep(tensor_dest, linear_index, b, op->hasAttr(kDsmemAttr));
         Value current_value = ml::LoadOp::create(b, ty, gep);
         Value masked_out_current_value =
             mlir::arith::AndIOp::create(b, current_value, inverse_mask);
@@ -1104,12 +1123,17 @@ class RewriteTensorInsert : public OpRewritePattern<mlir::tensor::InsertOp> {
         // We need to use directly op.getDest() as input, otherwise the
         // following rewrite might remove the only user of it.
         tensor_dest = op.getDest();
+        bool is_dsmem = op->hasAttr(kDsmemAttr);
         // Technically we should halve the number of elements when going to i8
-        // element type, but it doesn't really matter because we only actually
-        // use the element type. Indexing is done by linear index, and GEP ops
-        // don't care about the number of elements. The tensor types will
-        // disappear completely after the LowerTensors pass.
-        Type tensor_ty = tensor_dest.getType().clone(ty);
+        // element type, but it doesn't really matter unless DSMEM is used,
+        // where CreateGep splits linear_index by the per-CTA element count.
+        Type tensor_ty = is_dsmem
+                             ? tensor_dest.getType().clone(
+                                   {CeilOfRatio<int64_t>(
+                                       tensor_dest.getType().getNumElements(),
+                                       8 / *sub_byte_width)},
+                                   ty)
+                             : tensor_dest.getType().clone(ty);
         auto tensor_dest_i8 =
             UnrealizedConversionCastOp::create(b, tensor_ty, tensor_dest)
                 .getResult(0);
@@ -1122,6 +1146,9 @@ class RewriteTensorInsert : public OpRewritePattern<mlir::tensor::InsertOp> {
               arith::IndexCastUIOp::create(b, b.getIndexType(), linear_index));
         }
         auto atomic_rmw = AtomicRMWOp::create(b, tensor_dest_i8, rmw_indices);
+        if (is_dsmem) {
+          atomic_rmw->setAttr(kDsmemAttr, b.getUnitAttr());
+        }
         mlir::ImplicitLocOpBuilder body_builder(atomic_rmw.getLoc(),
                                                 atomic_rmw.getBodyBuilder());
         Value current_value = atomic_rmw.getCurrentValue();
@@ -1137,7 +1164,8 @@ class RewriteTensorInsert : public OpRewritePattern<mlir::tensor::InsertOp> {
         op.replaceAllUsesWith(casted_result);
       }
     } else {
-      auto gep = CreateGep(tensor_dest, linear_index, b);
+      auto gep =
+          CreateGep(tensor_dest, linear_index, b, op->hasAttr(kDsmemAttr));
       mlir::LLVMTypeConverter converter(getContext());
       auto llvm_type = converter.convertType(scalar_value.getType());
       scalar_value =
@@ -1499,7 +1527,8 @@ struct RewriteSyncThreads : OpRewritePattern<gpu::SyncThreadsOp> {
 
   LogicalResult matchAndRewrite(
       gpu::SyncThreadsOp op, mlir::PatternRewriter& rewriter) const override {
-    mlir::gpu::BarrierOp::create(rewriter, op.getLoc());
+    auto barrier = mlir::gpu::BarrierOp::create(rewriter, op.getLoc());
+    barrier.setScope(op.getScope());
     rewriter.replaceOp(op, op.getOperands());
     return success();
   }
@@ -1688,7 +1717,8 @@ AtomicWordAccess PrepareAtomicWordAccess(
     std::tie(linear_index, sub_byte_shift) =
         GetSubByteIndex(linear_index, *sub_byte_bit_width, b);
   }
-  Value addr = CreateGep(ResolveAddressTensor(tensor, b), linear_index, b);
+  Value addr = CreateGep(ResolveAddressTensor(tensor, b), linear_index, b,
+                         op->hasAttr(kDsmemAttr));
   Value shift;
   Value mask;
   if (small_type) {
@@ -2120,7 +2150,8 @@ class RewriteAtomicRMW : public OpRewritePattern<AtomicRMWOp> {
     mlir::ImplicitLocOpBuilder b(loc, rewriter);
 
     auto materialize_addr_and_modifier = [&]() -> std::pair<Value, Value> {
-      Value addr = CreateAtomicGep(op.getInput(), op.getIndices(), b);
+      Value addr = CreateAtomicGep(op.getInput(), op.getIndices(), b,
+                                   op->hasAttr(kDsmemAttr));
       Value modifier_arg = MaterializeAtomicModifier(
           rewriter, loc, modifier_parameters.modifier);
       return {addr, modifier_arg};

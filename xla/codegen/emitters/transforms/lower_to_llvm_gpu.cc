@@ -56,6 +56,7 @@ limitations under the License.
 #include "mlir/Support/LLVM.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "tsl/platform/protobuf.h"  // IWYU pragma: keep
+#include "xla/backends/gpu/codegen/emitters/ir/xla_gpu_ops.h"
 #include "xla/codegen/device_spec.h"
 #include "xla/codegen/emitters/transforms/lower_to_llvm_common.h"
 #include "xla/codegen/emitters/transforms/lowering_utils.h"
@@ -230,6 +231,21 @@ struct ExpBF16ToAMDGPU
 // and `bf16` `math.fma` to `f32`, calls `@__nv_fmaf`, and truncates back, which
 // double-rounds instead of using the native `fma.rn.f16` / `fma.rn.bf16`
 // instruction.
+class DsmemPointerToNVVM
+    : public mlir::ConvertOpToLLVMPattern<xla::gpu::DsmemPointerOp> {
+ public:
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      xla::gpu::DsmemPointerOp op, OpAdaptor adaptor,
+      mlir::ConversionPatternRewriter& rewriter) const override {
+    rewriter.replaceOpWithNewOp<mlir::NVVM::MapaOp>(
+        op, getTypeConverter()->convertType(op.getType()), adaptor.getPtr(),
+        adaptor.getCtaRank());
+    return mlir::success();
+  }
+};
+
 class FmaToLLVM : public mlir::ConvertOpToLLVMPattern<mlir::math::FmaOp> {
  public:
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
@@ -330,7 +346,9 @@ class LowerToLLVMGPUPass
       } else {
         mlir::populateGpuToNVVMConversionPatterns(converter, patterns);
         mlir::configureGpuToNVVMConversionLegality(target);
+        patterns.add<DsmemPointerToNVVM>(converter);
         patterns.add<FmaToLLVM>(converter, mlir::PatternBenefit(2));
+        target.addIllegalOp<xla::gpu::DsmemPointerOp>();
       }
       return mlir::success();
     };
