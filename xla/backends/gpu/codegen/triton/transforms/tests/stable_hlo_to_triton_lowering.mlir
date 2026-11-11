@@ -610,19 +610,17 @@ xtile.entry_func @variadic_reduce_scatter_one_shot(%input0: memref<4x1024xf32>, 
   %tile1 = xtile.extract %input1[%c0, %tile_id][2, 1][1, 1] : memref<4x16xf32> -> tensor<2x1xf32>
   // CHECK-DAG: %[[REMOTE0_PTR:.*]] = triton_xla.memref_to_ptr %[[REMOTE0]]
   // CHECK-DAG: %[[REMOTE1_PTR:.*]] = triton_xla.memref_to_ptr %[[REMOTE1]]
-  // Copy phase: one store per operand into its own symmetric buffer.
+  // Push phase: one store per operand into the peer rank's symmetric buffer.
   // CHECK: tt.addptr %[[REMOTE0_PTR]], %{{.*}} : !tt.ptr<i64>, i32
   // CHECK: tt.addptr %[[REMOTE1_PTR]], %{{.*}} : !tt.ptr<i64>, i32
   // A single barrier covers both operands.
   // CHECK: triton_xla.block_barrier {{.*}} <world_size = 2, signal_stride = 16, barrier_mode = producer_symmetric>
   // CHECK-NOT: triton_xla.block_barrier
   // CHECK-NOT: xtile.reduce_scatter
-  // Reduce phase: pull from both ranks and reduce, per operand.
-  // CHECK: tt.load %[[REMOTE0_PTR]] : !tt.ptr<i64>
-  // CHECK: tt.addptr %[[REMOTE0_PTR]], %{{.*}} : !tt.ptr<i64>, i64
+  // Reduce phase: read both ranks' slices from this rank's symmetric buffer and reduce, per operand.
+  // CHECK: tt.addptr %[[REMOTE0_PTR]], %{{.*}} : !tt.ptr<i64>, i32
   // CHECK: arith.addf {{.*}} : tensor<1x64xf32>
-  // CHECK: tt.load %[[REMOTE1_PTR]] : !tt.ptr<i64>
-  // CHECK: tt.addptr %[[REMOTE1_PTR]], %{{.*}} : !tt.ptr<i64>, i64
+  // CHECK: tt.addptr %[[REMOTE1_PTR]], %{{.*}} : !tt.ptr<i64>, i32
   // CHECK: arith.addf {{.*}} : tensor<1x1xf32>
   %out0, %out1 = xtile.reduce_scatter(%tile0, %tile1) scatter_dimension = 0 <replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>> : (tensor<2x64xf32>, tensor<2x1xf32>) -> (tensor<1x64xf32>, tensor<1x1xf32>) {
   ^bb0(%arg0: tensor<f32>, %arg1: tensor<f32>):
