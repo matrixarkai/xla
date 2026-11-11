@@ -14,25 +14,31 @@ limitations under the License.
 ==============================================================================*/
 #include "xla/python/transfer/streaming_ifrt.h"
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "absl/base/casts.h"
+#include "absl/base/thread_annotations.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/barrier.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/synchronization/notification.h"
+#include "absl/types/span.h"
 #include "tsl/platform/casts.h"
 #include "xla/future.h"
 #include "xla/pjrt/pjrt_compiler.h"
@@ -45,6 +51,7 @@ limitations under the License.
 #include "xla/python/pjrt_ifrt/pjrt_device.h"
 #include "xla/python/transfer/streaming.h"
 #include "xla/python/transfer/test_pattern.h"
+#include "xla/python/transfer/transfer_socket.pb.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/tsl/concurrency/ref_count.h"
@@ -283,6 +290,133 @@ TEST(PremappedCopierState, PoisonSlicedRaw) {
   fut_and_dest.first->Poison(absl::InternalError("Poisoning."));
   ASSERT_FALSE(fut_and_dest.second.Await().ok());
 }
+
+class CountingConnectionState : public ConnectionState {
+ public:
+  void Send(size_t req_id, const void* data, size_t offset, size_t size,
+            bool is_largest, absl::AnyInvocable<void() &&> on_done) override {
+    std::move(on_done)();
+    absl::MutexLock l(mu_);
+    ++num_sent_;
+  }
+
+  void SendError(size_t req_id, size_t offset, size_t size, bool is_largest,
+                 absl::Status status) override {
+    absl::MutexLock l(mu_);
+    ++num_errors_;
+  }
+
+  std::pair<int, int> Await(int expected_total) {
+    absl::MutexLock l(mu_);
+    auto done = [this, expected_total]() ABSL_SHARED_LOCKS_REQUIRED(mu_) {
+      return num_sent_ + num_errors_ == expected_total;
+    };
+    mu_.Await(absl::Condition(&done));
+    return {num_sent_, num_errors_};
+  }
+
+ private:
+  absl::Mutex mu_;
+  int num_sent_ ABSL_GUARDED_BY(mu_) = 0;
+  int num_errors_ ABSL_GUARDED_BY(mu_) = 0;
+};
+
+class PullTableEntryTest : public ::testing::TestWithParam<bool> {
+ protected:
+  absl::StatusOr<tsl::RCReference<PullTable::Entry>> MakeEntry(
+      int num_buffers) {
+    ABSL_ASSIGN_OR_RETURN(client_, xla::ifrt::test_util::GetClient());
+    std::shared_ptr<xla::PjRtClient> pjrt_client =
+        absl::down_cast<xla::ifrt::PjRtClient*>(client_.get())
+            ->shared_ptr_pjrt_client();
+    constexpr size_t kXferSize = 1024 * 1024;
+    ABSL_ASSIGN_OR_RETURN(std::shared_ptr<absl::Span<uint8_t>> scratch,
+                          AllocateAndMapPjrtMemory(pjrt_client, 4 * kXferSize));
+    auto cstate = std::make_shared<PremappedCopierState>(scratch, 4, kXferSize);
+    std::vector<PjRtBufferEntry::BufferRef> pjrt_refs;
+    std::vector<RawBufferEntry::BufferRef> raw_refs;
+    for (int i = 0; i < num_buffers; ++i) {
+      ABSL_ASSIGN_OR_RETURN(
+          xla::ifrt::ArrayRef arr,
+          tests::CopyTestPatternToDevice(client_.get(), client_->devices()[0],
+                                         tests::CreateTestPattern(i, 1024)));
+      ABSL_RETURN_IF_ERROR(arr->GetReadyFuture().Await());
+      std::shared_ptr<xla::PjRtBuffer> buf =
+          static_cast<xla::ifrt::PjRtCompatibleArray*>(arr.get())
+              ->pjrt_buffers()[0];
+      ABSL_ASSIGN_OR_RETURN(size_t size, buf->GetOnDeviceSizeInBytes());
+      if (GetParam()) {
+        ABSL_ASSIGN_OR_RETURN(
+            xla::PjRtRawBufferRef raw,
+            xla::PjRtRawBuffer::CreateRawAliasOfBuffer(buf.get()));
+        raw_refs.push_back({arr->GetReadyFuture(), std::move(raw), size});
+      } else {
+        pjrt_refs.push_back({std::move(buf), size});
+      }
+      arrays_.push_back(std::move(arr));
+    }
+    if (GetParam()) {
+      return tsl::MakeRef<RawBufferEntry>(std::move(raw_refs), cstate,
+                                          kXferSize);
+    }
+    return tsl::MakeRef<PjRtBufferEntry>(std::move(pjrt_refs), cstate,
+                                         kXferSize);
+  }
+
+  std::shared_ptr<xla::ifrt::Client> client_;
+  std::vector<xla::ifrt::ArrayRef> arrays_;
+};
+
+TEST_P(PullTableEntryTest, ConcurrentHandle) {
+  ASSERT_OK_AND_ASSIGN(tsl::RCReference<PullTable::Entry> entry,
+                       MakeEntry(/*num_buffers=*/2));
+  auto state = tsl::MakeRef<CountingConnectionState>();
+  absl::Barrier barrier(2);
+  std::atomic<int> num_completed{0};
+  {
+    auto start_racer = [&](uint64_t second_bid, size_t base_req_id) {
+      return std::unique_ptr<tsl::Thread>(tsl::Env::Default()->StartThread(
+          {}, "racer", [&, second_bid, base_req_id]() {
+            SocketTransferPullRequest req;
+            req.add_buffer_ids(0);
+            req.add_buffer_ids(second_bid);
+            barrier.Block();
+            if (entry->Handle(state, req, base_req_id)) {
+              num_completed.fetch_add(1, std::memory_order_relaxed);
+            }
+          }));
+    };
+    auto t0 = start_racer(/*second_bid=*/0, /*base_req_id=*/0);
+    auto t1 = start_racer(/*second_bid=*/1, /*base_req_id=*/2);
+  }
+  EXPECT_EQ(state->Await(4), std::make_pair(2, 2));
+  EXPECT_EQ(num_completed.load(std::memory_order_relaxed), 1);
+}
+
+TEST_P(PullTableEntryTest, CompletionTracking) {
+  ASSERT_OK_AND_ASSIGN(tsl::RCReference<PullTable::Entry> entry,
+                       MakeEntry(/*num_buffers=*/2));
+  auto state = tsl::MakeRef<CountingConnectionState>();
+  auto pull = [&](std::initializer_list<uint64_t> bids, size_t base_req_id) {
+    SocketTransferPullRequest req;
+    for (uint64_t bid : bids) {
+      req.add_buffer_ids(bid);
+    }
+    return entry->Handle(state, req, base_req_id);
+  };
+
+  EXPECT_FALSE(pull({99, 0, 0}, /*base_req_id=*/0));
+  EXPECT_FALSE(pull({0}, /*base_req_id=*/3));
+  EXPECT_TRUE(pull({1}, /*base_req_id=*/4));
+  EXPECT_FALSE(pull({1}, /*base_req_id=*/5));
+  EXPECT_EQ(state->Await(6), std::make_pair(2, 4));
+}
+
+INSTANTIATE_TEST_SUITE_P(EntryTypes, PullTableEntryTest, ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                           return info.param ? "RawBufferEntry"
+                                             : "PjRtBufferEntry";
+                         });
 
 TEST(Semaphore, Basic) {
   internal::IsLastSemaphore semaphore(15);
