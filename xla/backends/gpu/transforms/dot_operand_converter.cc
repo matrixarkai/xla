@@ -20,7 +20,9 @@ limitations under the License.
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "tsl/platform/tensor_float_32_utils.h"
+#include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
+#include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
 #include "xla/primitive_util.h"
 #include "xla/shape.h"
@@ -68,6 +70,118 @@ PrimitiveType DesiredOperandType(const HloInstruction* dot,
   return ShapeUtil::HigherPrecisionElementType(lhs->shape(), rhs->shape());
 }
 
+// Returns true if every value produced by `instr` is exactly representable in
+// BF16. Looks through data-movement ops to the producing upcast or
+// reduce-precision.
+//
+// BF16 has 8 exponent bits (the same range as F32 and TF32) and 7 explicit
+// mantissa bits (8 significand bits including the implicit leading one). Hence
+// a value is BF16-exact iff it fits in that exponent range and its significand
+// needs at most 8 bits. For example, every s8/u8 integer (|x| <= 255 < 2^8) and
+// every bf16 value is BF16-exact, while f16 (10 mantissa bits) and s16 are not.
+bool IsExactlyRepresentableInBf16(const HloInstruction* instr) {
+  switch (instr->opcode()) {
+    case HloOpcode::kConvert:
+      // Every instruction reached here has the dot operand's F32 element type
+      // (the look-through cases below require an unchanged element type), and
+      // F32 holds every BF16 value. So the result is BF16-exact iff the source
+      // type casts to BF16 without loss (e.g. s8, u8, s4, bf16, f8e4m3fn).
+      return primitive_util::CastPreservesValues(
+          instr->operand(0)->shape().element_type(), BF16);
+    case HloOpcode::kReducePrecision: {
+      // reduce-precision rounds to a float format with `exponent_bits` exponent
+      // bits and `mantissa_bits` explicit mantissa bits. Every value of that
+      // format (including its denormals) is a BF16 value iff it has at most
+      // ExponentWidth(BF16) = 8 exponent bits and at most
+      // SignificandWidth(BF16) - 1 = 7 explicit mantissa bits; the `- 1` is
+      // because SignificandWidth counts the implicit leading bit. NaN payloads
+      // may not survive the demotion, but NaNs stay NaNs.
+      const auto* reduce_precision = Cast<HloReducePrecisionInstruction>(instr);
+      return reduce_precision->exponent_bits() <=
+                 primitive_util::ExponentWidth(BF16) &&
+             reduce_precision->mantissa_bits() <=
+                 primitive_util::SignificandWidth(BF16) - 1;
+    }
+    case HloOpcode::kBitcast:
+    case HloOpcode::kBroadcast:
+    case HloOpcode::kCopy:
+    case HloOpcode::kReshape:
+    case HloOpcode::kSlice:
+    case HloOpcode::kTranspose:
+      // These ops only move values. A bitcast may also reinterpret the bits as
+      // a different element type, which does not preserve values, so only look
+      // through ops that keep the element type.
+      if (instr->operand(0)->shape().element_type() !=
+          instr->shape().element_type()) {
+        return false;
+      }
+      return IsExactlyRepresentableInBf16(instr->operand(0));
+    default:
+      // Conservatively only trust the element type of any other producer.
+      // Since the dot operand chain is F32, this is false in practice.
+      return primitive_util::CastPreservesValues(instr->shape().element_type(),
+                                                 BF16);
+  }
+}
+
+// Returns true if the F32 x F32 `dot` can be demoted to an exact BF16 x BF16
+// dot with the same output type. This holds when both operands only carry
+// BF16-exact values (e.g. `convert<f32>(s8)` and `convert<f32>(bf16)`) and the
+// dot already runs with TF32 inputs, i.e. it has no explicit algorithm, every
+// operand precision is at most HIGH and TF32 execution is enabled (the same
+// condition the cuBLAS, cuDNN and Triton emitters use to allow TF32).
+//
+// TF32 has 8 exponent bits and 10 explicit mantissa bits, a superset of BF16's
+// 8 exponent and 7 mantissa bits, so the TF32 path already sees exactly the
+// BF16-exact input values. The product of two values with 8-bit significands
+// needs at most 16 significand bits, so it is exact in F32 (24 bits). BF16 and
+// TF32 tensor-core MMAs both form these exact products and accumulate them in
+// F32, so the demotion does not change the dot's numerics (beyond the
+// accumulation order of whichever kernel config gets picked), while halving
+// the operand footprint in registers and shared memory.
+bool IsLosslessBf16Demotion(const HloInstruction* dot,
+                            const se::GpuComputeCapability& gpu_version) {
+  // Sparse and block-scaled dots carry extra (metadata or scale) operands; only
+  // handle plain lhs x rhs dots.
+  if (dot->operand_count() != 2) {
+    return false;
+  }
+  const HloInstruction* lhs = dot->operand(0);
+  const HloInstruction* rhs = dot->operand(1);
+  const PrimitiveType out_type = dot->shape().element_type();
+  if (lhs->shape().element_type() != F32 ||
+      rhs->shape().element_type() != F32 ||
+      (out_type != F32 && out_type != BF16)) {
+    return false;
+  }
+  const PrecisionConfig& precision_config = dot->precision_config();
+  if (precision_config.algorithm() != PrecisionConfig::ALG_UNSET ||
+      !absl::c_all_of(precision_config.operand_precision(),
+                      [](int p) { return p <= PrecisionConfig::HIGH; }) ||
+      !tsl::tensor_float_32_execution_enabled() ||
+      !DotOperandConverter::SupportsBf16Dot(gpu_version)) {
+    return false;
+  }
+  return IsExactlyRepresentableInBf16(lhs) && IsExactlyRepresentableInBf16(rhs);
+}
+
+// Returns a BF16 instruction with the same values as the BF16-exact F32
+// `operand`, folding a direct upcast into a single convert from its source.
+// Converting a BF16-exact value to BF16 is exact, since round-to-nearest-even
+// leaves a value that is already representable unchanged.
+HloInstruction* DemoteToBf16(HloInstruction* operand) {
+  if (operand->opcode() == HloOpcode::kConvert &&
+      primitive_util::CastPreservesValues(
+          operand->operand(0)->shape().element_type(), BF16)) {
+    operand = operand->mutable_operand(0);
+    if (operand->shape().element_type() == BF16) {
+      return operand;
+    }
+  }
+  return operand->AddInstruction(HloInstruction::CreateConvert(
+      ShapeUtil::ChangeElementType(operand->shape(), BF16), operand));
+}
+
 }  // namespace
 
 bool DotOperandConverter::SupportsBf16Dot(
@@ -93,7 +207,7 @@ bool DotOperandConverter::InstructionMatchesPattern(
   PrimitiveType rhs_type = rhs->shape().element_type();
 
   if (lhs_type == rhs_type) {
-    return false;
+    return IsLosslessBf16Demotion(instruction, gpu_version_);
   }
 
   // Exclude conversions between FP8 types.
@@ -105,6 +219,13 @@ bool DotOperandConverter::InstructionMatchesPattern(
 
 absl::StatusOr<HloInstruction*> DotOperandConverter::ExpandInstruction(
     HloInstruction* instruction) {
+  if (IsLosslessBf16Demotion(instruction, gpu_version_)) {
+    for (int i : {0, 1}) {
+      ABSL_RETURN_IF_ERROR(instruction->ReplaceOperandWithDifferentShape(
+          i, DemoteToBf16(instruction->mutable_operand(i))));
+    }
+    return nullptr;
+  }
   PrimitiveType desired_type = DesiredOperandType(instruction, gpu_version_);
   for (int i : {0, 1}) {
     HloInstruction* operand = instruction->mutable_operand(i);
