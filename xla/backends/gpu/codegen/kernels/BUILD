@@ -54,6 +54,8 @@ cc_library(
     deps = [
         ":custom_kernel_proto_cc",
         "//xla/backends/gpu/codegen:gpu_kernel_spec",
+        "//xla/service:buffer_assignment",
+        "//xla/service/gpu:launch_dimensions",
         "//xla/stream_executor:kernel_spec",
         "//xla/stream_executor:launch_dim",
         "@com_google_absl//absl/base:core_headers",
@@ -61,6 +63,7 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
