@@ -117,6 +117,10 @@ class OpaqueShardingSpecSerDes
           absl::StrCat("Unsupported ", version_number,
                        " for OpaqueShardingSpec deserialization"));
     }
+    if (proto.num_shards() < 0) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "`num_shards` must be non-negative: ", proto.num_shards()));
+    }
     return OpaqueShardingSpec::Create(proto.num_shards());
   }
 
@@ -253,8 +257,12 @@ class ConcreteEvenShardingSpecSerDes
           absl::StrCat("Unsupported ", version_number,
                        " for ConcreteEvenShardingSpec deserialization"));
     }
-    ABSL_ASSIGN_OR_RETURN(auto shape, Shape::FromProto(proto.shape()));
-    ABSL_ASSIGN_OR_RETURN(auto shard_shape,
+    if (proto.num_shards() < 0) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "`num_shards` must be non-negative: ", proto.num_shards()));
+    }
+    ABSL_ASSIGN_OR_RETURN(Shape shape, Shape::FromProto(proto.shape()));
+    ABSL_ASSIGN_OR_RETURN(Shape shard_shape,
                           Shape::FromProto(proto.shard_shape()));
     return ConcreteEvenShardingSpec::Create(
         proto.num_shards(), std::move(shape), std::move(shard_shape),

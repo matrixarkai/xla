@@ -78,6 +78,7 @@
 #include "xla/python/ifrt_proxy/server/host_buffer.h"
 #include "xla/python/ifrt_proxy/server/host_callback.h"
 #include "xla/python/pjrt_ifrt/xla_compiler.h"
+#include "xla/python/pjrt_ifrt/xla_sharding.pb.h"
 #include "xla/service/device_assignment.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
@@ -721,6 +722,115 @@ TEST_P(IfrtBackendHandlerTest, AssembleArrayFromSingleDeviceArrays) {
   EXPECT_NE(response->assemble_array_from_single_device_arrays_response()
                 .array_handle(),
             0);
+}
+
+TEST_P(IfrtBackendHandlerTest,
+       AssembleArrayRejectsMalformedHloShardingPayloads) {
+  DType dtype(DType::kF32);
+  std::vector<uint64_t> single_device_handles;
+  for (int i = 0; i < 4; ++i) {
+    auto array = tsl::MakeRef<xla::ifrt::MockArray>();
+    ON_CALL(*array, dtype()).WillByDefault(Return(dtype));
+    ASSERT_OK_AND_ASSIGN(uint64_t handle, MakeTestArray(array));
+    single_device_handles.push_back(handle);
+  }
+
+  auto make_assemble_request = [&](const HloShardingProto& hlo_sharding_proto) {
+    std::unique_ptr<IfrtRequest> req_wrapper = NewIfrtRequest(NewOpId());
+    AssembleArrayFromSingleDeviceArraysRequest* req =
+        req_wrapper->mutable_assemble_array_from_single_device_arrays_request();
+    req->mutable_shape()->add_dims(5);
+    req->set_copy_semantics(proto::ARRAY_COPY_SEMANTICS_ALWAYS_COPY);
+    req->set_single_device_shard_semantics(
+        proto::SINGLE_DEVICE_SHARD_SEMANTICS_ALL_SHARDS);
+    req->set_result_handle(NewOpId());
+    dtype.ToProto(*req->mutable_dtype(), ifrt_serdes_version());
+    for (uint64_t handle : single_device_handles) {
+      req->add_single_device_array_handles(handle);
+    }
+    Serialized* serialized =
+        req->mutable_sharding()->mutable_serialized_sharding();
+    serialized->set_type_name("xla::ifrt::HloSharding");
+    serialized->set_data(hlo_sharding_proto.SerializeAsString());
+    return req_wrapper;
+  };
+
+  EXPECT_CALL(*mock_client_,
+              AssembleArrayFromSingleDeviceArrays(_, _, _, _, _, _))
+      .Times(0);
+
+  // Duplicate tile_assignment_devices.
+  {
+    HloShardingProto proto;
+    proto.set_version_number(0);
+    ASSERT_OK_AND_ASSIGN(Device * dev0,
+                         mock_client_->LookupDevice(DeviceId(0)));
+    ASSERT_OK_AND_ASSIGN(Device * dev1,
+                         mock_client_->LookupDevice(DeviceId(1)));
+    BasicDeviceList::Create({dev0, dev1, dev0, dev1})
+        ->ToProto(*proto.mutable_devices(), ifrt_serdes_version());
+    xla::OpSharding* op = proto.mutable_xla_op_sharding();
+    op->set_type(xla::OpSharding::OTHER);
+    op->add_tile_assignment_dimensions(4);
+    op->add_tile_assignment_devices(0);
+    op->add_tile_assignment_devices(0);
+    op->add_tile_assignment_devices(2);
+    op->add_tile_assignment_devices(3);
+    EXPECT_THAT(CallBackend(make_assemble_request(proto)),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("not unique")));
+  }
+
+  // Mismatched device list size vs OpSharding num_devices.
+  {
+    HloShardingProto proto;
+    proto.set_version_number(0);
+    ASSERT_OK_AND_ASSIGN(Device * dev0,
+                         mock_client_->LookupDevice(DeviceId(0)));
+    BasicDeviceList::Create({dev0})->ToProto(*proto.mutable_devices(),
+                                             ifrt_serdes_version());
+    xla::OpSharding* op = proto.mutable_xla_op_sharding();
+    op->set_type(xla::OpSharding::OTHER);
+    op->add_tile_assignment_dimensions(2);
+    op->add_tile_assignment_devices(0);
+    op->add_tile_assignment_devices(1);
+    EXPECT_THAT(CallBackend(make_assemble_request(proto)),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("does not match")));
+  }
+
+  // Empty device list on HloSharding and sibling Sharding types.
+  {
+    HloShardingProto proto;
+    proto.set_version_number(0);
+    BasicDeviceList::Create({})->ToProto(*proto.mutable_devices(),
+                                         ifrt_serdes_version());
+    proto.mutable_xla_op_sharding()->set_type(xla::OpSharding::REPLICATED);
+    EXPECT_THAT(CallBackend(make_assemble_request(proto)),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("at least one device")));
+  }
+
+  for (absl::string_view type_name :
+       {"xla::ifrt::OpaqueSharding", "xla::ifrt::ConcreteSharding",
+        "xla::ifrt::ConcreteEvenSharding"}) {
+    std::unique_ptr<IfrtRequest> req_wrapper = NewIfrtRequest(NewOpId());
+    AssembleArrayFromSingleDeviceArraysRequest* req =
+        req_wrapper->mutable_assemble_array_from_single_device_arrays_request();
+    req->mutable_shape()->add_dims(5);
+    req->set_copy_semantics(proto::ARRAY_COPY_SEMANTICS_ALWAYS_COPY);
+    req->set_single_device_shard_semantics(
+        proto::SINGLE_DEVICE_SHARD_SEMANTICS_ALL_SHARDS);
+    req->set_result_handle(NewOpId());
+    dtype.ToProto(*req->mutable_dtype(), ifrt_serdes_version());
+    Serialized* serialized =
+        req->mutable_sharding()->mutable_serialized_sharding();
+    serialized->set_type_name(type_name);
+    serialized->set_data("");
+    EXPECT_THAT(CallBackend(std::move(req_wrapper)),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("at least one device")));
+  }
 }
 
 TEST_P(IfrtBackendHandlerTest, CopyToHostSuccess) {

@@ -974,6 +974,16 @@ class HloSharding {
   }
   friend class HloShardingTestHelper;
 
+  static absl::StatusOr<HloSharding> PartialTileInternal(
+      const TileAssignment& tile_assignment_last_dim_replicate,
+      absl::Span<const OpMetadata> metadata, bool allow_materialization);
+  static absl::StatusOr<HloSharding> SubgroupInternal(
+      const TileAssignment& tile_assignment,
+      absl::Span<const OpSharding::Type> subgroup_types,
+      absl::Span<const OpMetadata> metadata, bool allow_materialization);
+  static absl::StatusOr<HloSharding> V3ToV2ShardingInternal(
+      const NamedSharding& sharding, bool allow_materialization);
+
   static absl::StatusOr<HloSharding> FromProtoInternal(const OpSharding& proto);
 
   // Checks that the number of elements in tuple_elements_ is consistent with

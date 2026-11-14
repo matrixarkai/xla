@@ -17,10 +17,13 @@ limitations under the License.
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -39,6 +42,7 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/array.h"
+#include "xla/overflow_util.h"
 #include "xla/printer.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
@@ -67,9 +71,21 @@ namespace {
 // [1,3,1,4,1,5]T(4,3,2,5,1,0) => [3,4,5]T(1,2,0) => [3,20,1]T(1,0,2) =>
 // [3,20]T(1,0)
 void CanonicalizeIotaDims(absl::Span<int64_t>& dims, absl::Span<int>& perm) {
-  DCHECK_EQ(dims.size(), perm.size());
-  if (dims.size() <= 1) {
+  if (dims.size() != perm.size() || dims.size() <= 1) {
     return;
+  }
+  {
+    std::vector<bool> seen_perm(perm.size(), false);
+    for (size_t i = 0; i < dims.size(); ++i) {
+      if (dims[i] <= 0) {
+        return;
+      }
+      const int p = perm[i];
+      if (p < 0 || static_cast<size_t>(p) >= perm.size() || seen_perm[p]) {
+        return;
+      }
+      seen_perm[p] = true;
+    }
   }
   absl::InlinedVector<int, 6> old_to_new_dims(dims.size());
   while (true) {
@@ -111,7 +127,12 @@ void CanonicalizeIotaDims(absl::Span<int64_t>& dims, absl::Span<int>& perm) {
       const int base_dim = perm[base];
       const int dim = perm[i];
       if (base_dim + (i - base) == dim) {
-        dims[base_dim] *= dims[dim];
+        auto [merged, overflow] =
+            OverflowSafeMultiply(dims[base_dim], dims[dim]);
+        if (overflow) {
+          return;
+        }
+        dims[base_dim] = merged;
         dims[dim] = 1;
         changed = true;
       } else {
@@ -158,11 +179,13 @@ struct DecanonicalizationInfo {
       original_reshape_dim_to_new_transpose_perm_indices;
 };
 
-// Fully decanonicalizes reshape_dims into prime factors and return the new
-// reshape_dims and transpose_perm.
+// Fully decanonicalizes reshape_dims into factors needed to match target_dims
+// and returns the new reshape_dims and transpose_perm.
 DecanonicalizationInfo FullyDecanonicalize(
     absl::Span<const int64_t> reshape_dims,
-    absl::Span<const int> transpose_perm) {
+    absl::Span<const int> transpose_perm,
+    absl::Span<const int64_t> target_dims) {
+  static constexpr int64_t kMaxTrialFactor = 65536;
   DecanonicalizationInfo info;
   absl::InlinedVector<int, 6> old_to_new_dims(reshape_dims.size() + 1);
   for (int i = 0, n = reshape_dims.size(); i < n; ++i) {
@@ -171,15 +194,40 @@ DecanonicalizationInfo FullyDecanonicalize(
       info.new_reshape_dims.push_back(2);
       dim_size /= 2;
     }
-    for (int i = 3; i * i <= dim_size; i += 2) {
-      while (dim_size % i == 0) {
-        info.new_reshape_dims.push_back(i);
-        dim_size /= i;
+    for (int64_t factor = 3;
+         factor <= kMaxTrialFactor && factor <= dim_size / factor;
+         factor += 2) {
+      while (dim_size % factor == 0) {
+        info.new_reshape_dims.push_back(factor);
+        dim_size /= factor;
       }
     }
     if (dim_size > 1) {
       CHECK_GT(dim_size, 2);
-      info.new_reshape_dims.push_back(dim_size);
+      // Any remaining factor exceeds kMaxTrialFactor (so a 64 bit integer has
+      // at most 3 prime factors left). Split against target_dims via gcd to
+      // avoid O(sqrt(dim_size)) trial division on large primes.
+      absl::InlinedVector<int64_t, 4> pending = {dim_size};
+      while (!pending.empty()) {
+        const int64_t cur = pending.back();
+        pending.pop_back();
+        bool was_split = false;
+        for (int64_t target_dim : target_dims) {
+          if (target_dim <= 1) {
+            continue;
+          }
+          const int64_t g = std::gcd(cur, target_dim);
+          if (g > 1 && g < cur) {
+            pending.push_back(cur / g);
+            pending.push_back(g);
+            was_split = true;
+            break;
+          }
+        }
+        if (!was_split) {
+          info.new_reshape_dims.push_back(cur);
+        }
+      }
     }
     old_to_new_dims[i + 1] = info.new_reshape_dims.size();
   }
@@ -275,7 +323,16 @@ std::optional<IotaTileAssignment> TryToConvertV1ToV2(const TileAssignment& T) {
 
 /*static*/ IotaTileAssignment IotaTileAssignment::Create(
     absl::Span<const int64_t> dims) {
-  return IotaTileAssignment(dims, {Product(dims)}, {0});
+  int64_t product = 1;
+  for (int64_t dim : dims) {
+    auto [next, overflow] = OverflowSafeMultiply(product, dim);
+    if (overflow) {
+      product = -1;
+      break;
+    }
+    product = next;
+  }
+  return IotaTileAssignment(dims, {product}, {0});
 }
 
 /*static*/ IotaTileAssignment IotaTileAssignment::Create(
@@ -289,10 +346,10 @@ std::optional<IotaTileAssignment> TryToConvertV1ToV2(const TileAssignment& T) {
   auto perm_span = absl::MakeSpan(canonicalized_perm);
   CanonicalizeIotaDims(dims_span, perm_span);
   if (dims_span.empty()) {
-    canonicalized_dims[0] = 1;
-    dims_span = absl::MakeSpan(canonicalized_dims.data(), 1);
-    canonicalized_perm[0] = 0;
-    perm_span = absl::MakeSpan(canonicalized_perm.data(), 1);
+    canonicalized_dims.assign({1});
+    dims_span = absl::MakeSpan(canonicalized_dims);
+    canonicalized_perm.assign({0});
+    perm_span = absl::MakeSpan(canonicalized_perm);
   }
   return IotaTileAssignment(dims, dims_span, perm_span);
 }
@@ -310,6 +367,29 @@ std::optional<IotaTileAssignment> TryToConvertV1ToV2(const TileAssignment& T) {
 Array<int64_t> ToArray(absl::Span<const int64_t> reshape_dims,
                        absl::Span<const int> transpose_perm,
                        absl::Span<const int64_t> dims) {
+  CHECK_EQ(reshape_dims.size(), transpose_perm.size());
+  int64_t reshape_elements = 1;
+  for (int64_t dim : reshape_dims) {
+    CHECK_GT(dim, 0);
+    auto [next, overflow] = OverflowSafeMultiply(reshape_elements, dim);
+    CHECK(!overflow);
+    reshape_elements = next;
+  }
+  int64_t dims_elements = 1;
+  for (int64_t dim : dims) {
+    CHECK_GT(dim, 0);
+    auto [next, overflow] = OverflowSafeMultiply(dims_elements, dim);
+    CHECK(!overflow);
+    dims_elements = next;
+  }
+  CHECK_EQ(reshape_elements, dims_elements);
+  std::vector<bool> seen_perm(transpose_perm.size(), false);
+  for (int p : transpose_perm) {
+    CHECK_GE(p, 0);
+    CHECK_LT(static_cast<size_t>(p), transpose_perm.size());
+    CHECK(!seen_perm[p]);
+    seen_perm[p] = true;
+  }
   Array<int64_t> array(reshape_dims);
   array.FillIota(0);
   array.TransposeDimensions(transpose_perm);
@@ -328,7 +408,7 @@ IotaTileAssignment::IotaTileAssignment(const IotaTileAssignment& other)
 
 IotaTileAssignment& IotaTileAssignment::operator=(
     const IotaTileAssignment& other) {
-  const int new_size = other.size_bytes();
+  const size_t new_size = other.size_bytes();
   if (size_bytes() != new_size) {
     storage_.reset(new char[new_size]);
   }
@@ -341,20 +421,36 @@ IotaTileAssignment& IotaTileAssignment::operator=(
 IotaTileAssignment::IotaTileAssignment(absl::Span<const int64_t> dims,
                                        absl::Span<const int64_t> reshape_dims,
                                        absl::Span<const int> transpose_perm)
-    : IotaTileAssignment(dims.size(), reshape_dims.size()) {
+    : IotaTileAssignment(
+          [&] {
+            CHECK_LE(dims.size(),
+                     static_cast<size_t>(std::numeric_limits<int>::max()));
+            return static_cast<int>(dims.size());
+          }(),
+          [&] {
+            CHECK_LE(reshape_dims.size(),
+                     static_cast<size_t>(std::numeric_limits<int>::max()));
+            return static_cast<int>(reshape_dims.size());
+          }()) {
   DCHECK_EQ(reshape_dims.size(), transpose_perm.size());
-  std::memcpy(dims_ptr(), dims.data(), ndims_ * sizeof(int64_t));
-  DCHECK_EQ(num_elements(), Product(reshape_dims));
-  std::memcpy(reshape_dims_ptr(), reshape_dims.data(),
-              reshape_ndims_ * sizeof(int64_t));
-  std::memcpy(transpose_perm_ptr(), transpose_perm.data(),
-              reshape_ndims_ * sizeof(int));
+  if (ndims_ > 0) {
+    std::memcpy(dims_ptr(), dims.data(),
+                static_cast<size_t>(ndims_) * sizeof(int64_t));
+  }
+  if (reshape_ndims_ > 0) {
+    std::memcpy(reshape_dims_ptr(), reshape_dims.data(),
+                static_cast<size_t>(reshape_ndims_) * sizeof(int64_t));
+    std::memcpy(transpose_perm_ptr(), transpose_perm.data(),
+                static_cast<size_t>(reshape_ndims_) * sizeof(int));
+  }
 }
 
 IotaTileAssignment::IotaTileAssignment(int ndims, int reshape_ndims)
-    : ndims_(ndims),
-      reshape_ndims_(reshape_ndims),
-      storage_(new char[size_bytes()]) {}
+    : ndims_(ndims), reshape_ndims_(reshape_ndims), storage_([&] {
+        CHECK_GE(ndims, 0);
+        CHECK_GE(reshape_ndims, 0);
+        return std::unique_ptr<char[]>(new char[size_bytes()]);
+      }()) {}
 
 std::optional<IotaTileAssignment> IotaTileAssignment::Transpose(
     absl::Span<const int> perm) const {
@@ -409,7 +505,7 @@ std::optional<IotaTileAssignment> IotaTileAssignment::Transpose(
   }
 
   DecanonicalizationInfo decanonicalization_info =
-      FullyDecanonicalize(reshape_dims, transpose_perm);
+      FullyDecanonicalize(reshape_dims, transpose_perm, non_one_dims);
   auto& decanonicalized_reshape_dims = decanonicalization_info.new_reshape_dims;
   const auto& decanonicalized_transpose_perm =
       decanonicalization_info.new_transpose_perm;
@@ -559,6 +655,9 @@ std::string IotaTileAssignment::ToString() const {
 
 int64_t IotaTileAssignment::value_at(absl::Span<const int64_t> index) const {
   DCHECK_EQ(index.size(), ndims_);
+  if (ndims_ == 0 || reshape_ndims_ == 0) {
+    return 0;
+  }
   int64_t linear_index = index[0];
   auto dims = this->dims();
   for (int64_t i = 1; i < ndims_; ++i) {
@@ -569,8 +668,8 @@ int64_t IotaTileAssignment::value_at(absl::Span<const int64_t> index) const {
   auto transpose_perm = this->transpose_perm();
   absl::InlinedVector<int64_t, 6> reshape_index(reshape_ndims_);
   for (int64_t i = reshape_ndims_ - 1; i >= 0; --i) {
-    int dim = transpose_perm[i];
-    int dim_size = reshape_dims[dim];
+    const int dim = transpose_perm[i];
+    const int64_t dim_size = reshape_dims[dim];
     reshape_index[dim] = linear_index % dim_size;
     linear_index /= dim_size;
   }
@@ -659,6 +758,9 @@ TileAssignment& TileAssignment::operator=(TileAssignment&& other) {
 }
 
 bool TileAssignment::operator==(const TileAssignment& other) const {
+  if (dimensions() != other.dimensions()) {
+    return false;
+  }
   if (iota_ && other.iota_) {
     return *iota_ == *other.iota_;
   }

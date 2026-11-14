@@ -94,6 +94,10 @@ SingleDeviceShardingSpec::SingleDeviceShardingSpec()
 
 absl::StatusOr<ShardingRef> SingleDeviceShardingSpec::ToSharding(
     DeviceListRef devices, MemoryKind memory_kind) const {
+  if (devices == nullptr) {
+    return absl::InvalidArgumentError(
+        "SingleDeviceSharding requires a non-null DeviceList");
+  }
   if (devices->size() != 1) {
     return absl::InvalidArgumentError(absl::StrFormat(
         "SingleDeviceShardingSpec requires 1 device, but received %d devices",
@@ -175,6 +179,10 @@ OpaqueShardingSpec::OpaqueShardingSpec(int num_shards)
 
 absl::StatusOr<ShardingRef> OpaqueShardingSpec::ToSharding(
     DeviceListRef devices, MemoryKind memory_kind) const {
+  if (devices == nullptr || devices->devices().empty()) {
+    return absl::InvalidArgumentError(
+        "OpaqueSharding requires at least one device");
+  }
   if (devices->size() != num_shards()) {
     return absl::InvalidArgumentError(absl::StrFormat(
         "OpaqueShardingSpec requires %d devices, but received %d devices",
@@ -303,6 +311,10 @@ ConcreteShardingSpec::ConcreteShardingSpec(const ConcreteShardingSpec& other)
 
 absl::StatusOr<ShardingRef> ConcreteShardingSpec::ToSharding(
     DeviceListRef devices, MemoryKind memory_kind) const {
+  if (devices == nullptr || devices->devices().empty()) {
+    return absl::InvalidArgumentError(
+        "ConcreteSharding requires at least one device");
+  }
   if (devices->size() != num_shards()) {
     return absl::InvalidArgumentError(absl::StrFormat(
         "ConcreteShardingSpec requires %d devices, but received %d devices",
@@ -517,6 +529,10 @@ ConcreteEvenShardingSpec::ConcreteEvenShardingSpec(
 
 absl::StatusOr<ShardingRef> ConcreteEvenShardingSpec::ToSharding(
     DeviceListRef devices, MemoryKind memory_kind) const {
+  if (devices == nullptr || devices->devices().empty()) {
+    return absl::InvalidArgumentError(
+        "ConcreteEvenSharding requires at least one device");
+  }
   if (devices->size() != num_shards()) {
     return absl::InvalidArgumentError(absl::StrFormat(
         "ConcreteEvenShardingSpec requires %d devices, but received %d devices",

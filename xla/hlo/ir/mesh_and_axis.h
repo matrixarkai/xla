@@ -25,6 +25,8 @@ limitations under the License.
 #include <vector>
 
 #include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/array.h"
@@ -100,6 +102,7 @@ class Mesh {
   MeshProto ToProto() const;
 
   static Mesh FromProto(const MeshProto& proto);
+  static absl::StatusOr<Mesh> TryFromProto(const MeshProto& proto);
 
   const TileAssignment& device_assignment() const { return device_assignment_; }
   absl::Span<const std::string> axis_names() const { return axes_names_; }
@@ -198,6 +201,7 @@ class AxisRef {
   AxisRefProto ToProto() const;
 
   static AxisRef FromProto(const AxisRefProto& proto);
+  static absl::StatusOr<AxisRef> TryFromProto(const AxisRefProto& proto);
 
   bool CanCoexistWithoutOverlap(const AxisRef& other) const;
 

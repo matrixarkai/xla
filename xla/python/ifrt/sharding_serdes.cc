@@ -81,9 +81,10 @@ class SingleDeviceShardingSerDes
       std::unique_ptr<DeserializeOptions> options) override {
     const auto* deserialize_sharding_options =
         dyn_cast_or_null<DeserializeShardingOptions>(options.get());
-    if (deserialize_sharding_options == nullptr) {
+    if (deserialize_sharding_options == nullptr ||
+        deserialize_sharding_options->client == nullptr) {
       return absl::InvalidArgumentError(
-          "DeserializeShardingOptions must be provided");
+          "DeserializeShardingOptions with non-null client must be provided");
     }
 
     SingleDeviceShardingProto proto;
@@ -142,9 +143,10 @@ class OpaqueShardingSerDes : public RTTIExtends<OpaqueShardingSerDes, SerDes> {
       std::unique_ptr<DeserializeOptions> options) override {
     const auto* deserialize_sharding_options =
         dyn_cast_or_null<DeserializeShardingOptions>(options.get());
-    if (deserialize_sharding_options == nullptr) {
+    if (deserialize_sharding_options == nullptr ||
+        deserialize_sharding_options->client == nullptr) {
       return absl::InvalidArgumentError(
-          "DeserializeShardingOptions must be provided");
+          "DeserializeShardingOptions with non-null client must be provided");
     }
 
     OpaqueShardingProto proto;
@@ -159,9 +161,13 @@ class OpaqueShardingSerDes : public RTTIExtends<OpaqueShardingSerDes, SerDes> {
                        " for OpaqueSharding deserialization"));
     }
     ABSL_ASSIGN_OR_RETURN(
-        auto devices,
+        DeviceListRef devices,
         DeviceList::FromProto(deserialize_sharding_options->client,
                               proto.devices()));
+    if (devices->devices().empty()) {
+      return absl::InvalidArgumentError(
+          "OpaqueSharding requires at least one device");
+    }
     MemoryKind memory_kind;
     if (proto.has_memory_kind()) {
       memory_kind = MemoryKind(proto.memory_kind());
@@ -222,9 +228,10 @@ class ConcreteShardingSerDes
       std::unique_ptr<DeserializeOptions> options) override {
     const auto* deserialize_sharding_options =
         dyn_cast_or_null<DeserializeShardingOptions>(options.get());
-    if (deserialize_sharding_options == nullptr) {
+    if (deserialize_sharding_options == nullptr ||
+        deserialize_sharding_options->client == nullptr) {
       return absl::InvalidArgumentError(
-          "DeserializeShardingOptions must be provided");
+          "DeserializeShardingOptions with non-null client must be provided");
     }
 
     ConcreteShardingProto proto;
@@ -239,9 +246,13 @@ class ConcreteShardingSerDes
                        " for ConcreteSharding deserialization"));
     }
     ABSL_ASSIGN_OR_RETURN(
-        auto devices,
+        DeviceListRef devices,
         DeviceList::FromProto(deserialize_sharding_options->client,
                               proto.devices()));
+    if (devices->devices().empty()) {
+      return absl::InvalidArgumentError(
+          "ConcreteSharding requires at least one device");
+    }
     MemoryKind memory_kind;
     if (proto.has_memory_kind()) {
       memory_kind = MemoryKind(proto.memory_kind());
@@ -327,9 +338,10 @@ class ConcreteEvenShardingSerDes
       std::unique_ptr<DeserializeOptions> options) override {
     const auto* deserialize_sharding_options =
         dyn_cast_or_null<DeserializeShardingOptions>(options.get());
-    if (deserialize_sharding_options == nullptr) {
+    if (deserialize_sharding_options == nullptr ||
+        deserialize_sharding_options->client == nullptr) {
       return absl::InvalidArgumentError(
-          "DeserializeShardingOptions must be provided");
+          "DeserializeShardingOptions with non-null client must be provided");
     }
 
     ConcreteEvenShardingProto proto;
@@ -344,9 +356,13 @@ class ConcreteEvenShardingSerDes
                        " for ConcreteEvenSharding deserialization"));
     }
     ABSL_ASSIGN_OR_RETURN(
-        auto devices,
+        DeviceListRef devices,
         DeviceList::FromProto(deserialize_sharding_options->client,
                               proto.devices()));
+    if (devices->devices().empty()) {
+      return absl::InvalidArgumentError(
+          "ConcreteEvenSharding requires at least one device");
+    }
     MemoryKind memory_kind;
     if (proto.has_memory_kind()) {
       memory_kind = MemoryKind(proto.memory_kind());

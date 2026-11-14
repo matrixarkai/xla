@@ -28,7 +28,6 @@ limitations under the License.
 #include "xla/python/ifrt/serdes_version.h"
 #include "xla/python/pjrt_ifrt/xla_sharding_spec.h"
 #include "xla/python/pjrt_ifrt/xla_sharding_spec.pb.h"
-#include "xla/tsl/platform/statusor.h"
 
 namespace xla {
 namespace ifrt {
@@ -77,8 +76,25 @@ class HloShardingSpecSerDes
           absl::StrCat("Unsupported ", version_number,
                        " for HloShardingSpec deserialization"));
     }
-    ABSL_ASSIGN_OR_RETURN(auto xla_hlo_sharding,
+    if (proto.num_shards() < 0) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "`num_shards` must be non-negative: ", proto.num_shards()));
+    }
+    ABSL_ASSIGN_OR_RETURN(xla::HloSharding xla_hlo_sharding,
                           xla::HloSharding::FromProto(proto.xla_op_sharding()));
+    if (xla_hlo_sharding.IsTuple()) {
+      return absl::InvalidArgumentError(
+          "Tuple HloSharding is not supported for deserialization");
+    }
+    if (!xla_hlo_sharding.IsReplicated() && !xla_hlo_sharding.IsUnreduced() &&
+        xla_hlo_sharding.IsTiled() &&
+        proto.num_shards() != xla_hlo_sharding.num_devices()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "`num_shards` and `xla_hlo_sharding`'s `num_devices` does not "
+          "match: ",
+          proto.num_shards(), " vs. ", xla_hlo_sharding.num_devices(),
+          "; sharding=", xla_hlo_sharding.ToString()));
+    }
 
     return HloShardingSpec::Create(proto.num_shards(),
                                    std::move(xla_hlo_sharding));

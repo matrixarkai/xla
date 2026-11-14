@@ -116,6 +116,11 @@ absl::StatusOr<BoundedDynamicShapeTag> BoundedDynamicShapeTag::FromProto(
                      " for BoundedDynamicShapeTag deserialization"));
   }
 
+  if (!absl::c_any_of(proto.is_dynamic_dims(), [](bool b) { return b; })) {
+    return absl::InvalidArgumentError(
+        "At least one dimension needs to be dynamically sized.");
+  }
+
   BoundedDynamicShapeTag::DynamicDimensions dynamic_dims;
   dynamic_dims.reserve(proto.is_dynamic_dims_size());
   for (bool dynamic_dim : proto.is_dynamic_dims()) {

@@ -25,6 +25,7 @@ limitations under the License.
 #include "absl/algorithm/container.h"
 #include "absl/log/check.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/mesh_and_axis.h"
 #include "xla/hlo/ir/tile_assignment.h"
@@ -56,6 +57,8 @@ class NamedSharding {
 
     NamedShardingProto::DimensionSharding ToProto() const;
     static DimensionSharding FromProto(
+        const NamedShardingProto::DimensionSharding& proto);
+    static absl::StatusOr<DimensionSharding> TryFromProto(
         const NamedShardingProto::DimensionSharding& proto);
 
     // Note that by default we assume closed sharding.
@@ -123,6 +126,8 @@ class NamedSharding {
 
   NamedShardingProto ToProto() const;
   static NamedSharding FromProto(const NamedShardingProto& proto);
+  static absl::StatusOr<NamedSharding> TryFromProto(
+      const NamedShardingProto& proto);
 
   explicit NamedSharding(Mesh mesh,
                          absl::Span<const DimensionSharding> dim_shardings = {},
@@ -250,6 +255,8 @@ class NamedSharding {
 
  private:
   friend class HloSharding;
+
+  NamedSharding() = default;
 
   void InitShardedSizes() {
     sharded_sizes_.reserve(dim_shardings_.size());

@@ -18,9 +18,11 @@ limitations under the License.
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -37,6 +39,7 @@ limitations under the License.
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/array.h"
+#include "xla/overflow_util.h"
 #include "xla/printer.h"
 #include "xla/xla_data.pb.h"
 
@@ -112,7 +115,15 @@ class IotaTileAssignment {
   }
 
   int64_t num_elements() const {
-    return absl::c_accumulate(dims(), 1LL, std::multiplies<int64_t>());
+    int64_t product = 1;
+    for (int64_t dim : dims()) {
+      auto [next, overflow] = OverflowSafeMultiply(product, dim);
+      if (overflow) {
+        return -1;
+      }
+      product = next;
+    }
+    return product;
   }
 
   // TODO(b/281892190): This should really not return optional, when we are
@@ -130,8 +141,8 @@ class IotaTileAssignment {
 
  private:
   friend class TileAssignment;
-  static constexpr int kPerDimBytes = sizeof(int64_t);
-  static constexpr int kPerReshapeDimBytes = sizeof(int64_t) + sizeof(int);
+  static constexpr size_t kPerDimBytes = sizeof(int64_t);
+  static constexpr size_t kPerReshapeDimBytes = sizeof(int64_t) + sizeof(int);
 
   explicit IotaTileAssignment(absl::Span<const int64_t> dims,
                               absl::Span<const int64_t> reshape_dims,
@@ -156,8 +167,9 @@ class IotaTileAssignment {
         const_cast<const IotaTileAssignment*>(this)->transpose_perm_ptr());
   }
 
-  int size_bytes() const {
-    return ndims_ * kPerDimBytes + reshape_ndims_ * kPerReshapeDimBytes;
+  size_t size_bytes() const {
+    return static_cast<size_t>(ndims_) * kPerDimBytes +
+           static_cast<size_t>(reshape_ndims_) * kPerReshapeDimBytes;
   }
   int32_t ndims_;
   int32_t reshape_ndims_;

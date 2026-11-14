@@ -30,6 +30,7 @@ limitations under the License.
 #include "xla/array2d.h"
 #include "xla/hlo/ir/tile_assignment.h"
 #include "xla/tsl/util/proto/proto_matchers.h"
+#include "xla/xla_data.pb.h"
 
 using ::tsl::proto_testing::EqualsProto;
 
@@ -219,6 +220,24 @@ TEST(MeshAndAxisTest, ValidatesMesh) {
         Mesh mesh_with_duplicate_axis_names({1, 2, 3, 4}, {"x", "y", "z", "x"});
       },
       "Mesh has duplicate axis names. Duplicate axis name: x");
+
+  EXPECT_DEATH(
+      {
+        Mesh mesh_bad_iota_perm(
+            TileAssignment(/*dims=*/{2, 2}, /*reshape_dims=*/{2, 2},
+                           /*transpose_perm=*/{99, 0}),
+            {"a", "b"});
+      },
+      "transpose_perm");
+
+  EXPECT_DEATH(
+      {
+        Mesh mesh_zero_reshape_dim(
+            TileAssignment(/*dims=*/{2, 2}, /*reshape_dims=*/{0, 4},
+                           /*transpose_perm=*/{0, 1}),
+            {"a", "b"});
+      },
+      "reshape_dims must be positive");
 }
 
 TEST(MeshAndAxisTest, FromProtoValidation) {
@@ -596,6 +615,82 @@ TEST(MeshAndAxisTest, OperatorLess) {
 
   // Different axes
   EXPECT_TRUE(AxisRef(0) < AxisRef(1));
+}
+
+TEST(MeshAndAxisTest, TryFromProtoRejectsInvalidProtos) {
+  {
+    MeshProto proto;
+    proto.mutable_iota_transform()->add_reshape_dims(1);
+    proto.mutable_iota_transform()->add_transpose_perm(0);
+    EXPECT_THAT(Mesh::TryFromProto(proto),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("must not have an iota transform")));
+  }
+
+  {
+    MeshProto proto;
+    proto.add_device_ids(-1);
+    EXPECT_THAT(Mesh::TryFromProto(proto),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("must be non-negative")));
+  }
+
+  {
+    MeshProto proto;
+    MeshProto::MeshAxis* axis_a = proto.add_axes();
+    axis_a->set_name("a");
+    axis_a->set_size(4611686018427387905LL);
+    MeshProto::MeshAxis* axis_b = proto.add_axes();
+    axis_b->set_name("b");
+    axis_b->set_size(4);
+    EXPECT_THAT(
+        Mesh::TryFromProto(proto),
+        StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("overflows")));
+  }
+
+  {
+    MeshProto proto;
+    MeshProto::MeshAxis* axis = proto.add_axes();
+    axis->set_name("a");
+    axis->set_size(4);
+    proto.mutable_iota_transform()->add_reshape_dims(2);
+    proto.mutable_iota_transform()->add_reshape_dims(2);
+    proto.mutable_iota_transform()->add_transpose_perm(0);
+    proto.mutable_iota_transform()->add_transpose_perm(0);
+    EXPECT_THAT(
+        Mesh::TryFromProto(proto),
+        StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("not unique")));
+  }
+
+  {
+    MeshProto proto;
+    MeshProto::MeshAxis* axis = proto.add_axes();
+    axis->set_name("a");
+    axis->set_size(2);
+    proto.add_device_ids(0);
+    proto.add_device_ids(0);
+    EXPECT_THAT(
+        Mesh::TryFromProto(proto),
+        StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("permutation")));
+  }
+
+  {
+    AxisRefProto proto;
+    proto.set_mesh_axis_index(-1);
+    EXPECT_THAT(AxisRef::TryFromProto(proto),
+                StatusIs(absl::StatusCode::kInvalidArgument,
+                         HasSubstr("Axis index must be non-negative")));
+  }
+
+  {
+    AxisRefProto proto;
+    proto.set_mesh_axis_index(0);
+    proto.mutable_sub_axis_info()->set_pre_size(4611686018427387904LL);
+    proto.mutable_sub_axis_info()->set_size(4);
+    EXPECT_THAT(
+        AxisRef::TryFromProto(proto),
+        StatusIs(absl::StatusCode::kInvalidArgument, HasSubstr("overflows")));
+  }
 }
 
 }  // namespace xla

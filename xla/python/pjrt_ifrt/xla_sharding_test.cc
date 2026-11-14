@@ -24,8 +24,10 @@ limitations under the License.
 #include <utility>
 
 #include "absl/hash/hash_testing.h"
+#include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/types/span.h"
+#include "xla/array.h"
 #include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/hlo/ir/tile_assignment.h"
 #include "xla/python/ifrt/basic_device_list.h"
@@ -913,6 +915,125 @@ TEST_P(HloShardingTest, ShardingSpec) {
   ShardingSpecRef sharding_spec = sharding->sharding_spec();
   EXPECT_EQ(*sharding_spec,
             *HloShardingSpec::Create(device_list->size(), xla_hlo_sharding));
+}
+
+TEST_P(HloShardingTest, RejectsDuplicateTileAssignmentDevices) {
+  // Duplicate tile_assignment_devices in OpSharding is rejected at FromProto.
+  xla::OpSharding duplicate_proto;
+  duplicate_proto.set_type(xla::OpSharding::OTHER);
+  duplicate_proto.add_tile_assignment_dimensions(4);
+  duplicate_proto.add_tile_assignment_devices(0);
+  duplicate_proto.add_tile_assignment_devices(0);
+  duplicate_proto.add_tile_assignment_devices(2);
+  duplicate_proto.add_tile_assignment_devices(3);
+  EXPECT_THAT(xla::HloSharding::FromProto(duplicate_proto),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("device 0 is not unique")));
+
+  // Direct C++ construction bypassing FromProto is also safely rejected.
+  DeviceListRef device_list = GetDevices({0, 1, 2, 3});
+  xla::HloSharding duplicate_sharding =
+      xla::HloSharding::Tile(xla::Array<int64_t>({4}, {0, 0, 2, 3}));
+  ShardingRef sharding =
+      HloSharding::Create(device_list, MemoryKind(), duplicate_sharding);
+
+  EXPECT_THAT(sharding->IndexDomains(Shape({5}),
+                                     SingleDeviceShardSemantics::kAllShards),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("Duplicate device id")));
+  EXPECT_THAT(
+      sharding->Disassemble(Shape({5}), SingleDeviceShardSemantics::kAllShards),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                             HasSubstr("Duplicate device id")));
+  EXPECT_THAT(sharding->sharding_spec()->UniqueIndexDomains(Shape({5})),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("Duplicate device id")));
+  EXPECT_THAT(sharding->sharding_spec()->ShardToUniqueIndexDomainIndex(),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("Duplicate device id")));
+}
+
+TEST_P(HloShardingTest, RejectsOutOfRangeTileAssignmentDevices) {
+  DeviceListRef device_list = GetDevices({0, 1});
+  xla::HloSharding sparse_sharding =
+      xla::HloSharding::Tile(xla::Array<int64_t>({2}, {2, 5}));
+  ShardingRef sharding =
+      HloSharding::Create(device_list, MemoryKind(), sparse_sharding);
+
+  EXPECT_THAT(sharding->IndexDomains(Shape({5}),
+                                     SingleDeviceShardSemantics::kAllShards),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("Out of range device id")));
+  EXPECT_THAT(sharding->sharding_spec()->UniqueIndexDomains(Shape({5})),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("Out of range device id")));
+  EXPECT_THAT(sharding->sharding_spec()->ShardToUniqueIndexDomainIndex(),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("Out of range device id")));
+
+  // Also test slow path with nonreplicated subgroup and sparse device IDs.
+  xla::HloSharding subgroup_sparse_sharding = xla::HloSharding::Subgroup(
+      xla::TileAssignment(std::make_shared<const xla::Array<int64_t>>(
+          std::initializer_list<int64_t>{2, 2},
+          std::initializer_list<int64_t>{2, 3, 5, 7})),
+      {xla::OpSharding::MAXIMAL});
+  ShardingRef subgroup_sharding = HloSharding::Create(
+      GetDevices({0, 1, 2, 3}), MemoryKind(), subgroup_sparse_sharding);
+  EXPECT_THAT(subgroup_sharding->IndexDomains(
+                  Shape({4}), SingleDeviceShardSemantics::kAllShards),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("Out of range device id")));
+
+  // Negative Shape dimensions are rejected without negative shard shapes, and
+  // negative or overflowing IotaTile dimensions fail Create.
+  ShardingRef valid_tiled_sharding =
+      HloSharding::Create(GetDevices({0, 1, 2, 3}), MemoryKind(),
+                          xla::HloSharding::IotaTile({2, 2}));
+  EXPECT_THAT(valid_tiled_sharding->Disassemble(
+                  Shape({-4, 8}), SingleDeviceShardSemantics::kAllShards),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("must be nonnegative")));
+  EXPECT_THAT(valid_tiled_sharding->WithDeviceAssignment(
+                  DeviceListRef(), /*memory_kind=*/std::nullopt),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("non-null DeviceList")));
+  EXPECT_DEATH(HloSharding::Create(GetDevices({0, 1, 2, 3}), MemoryKind(),
+                                   xla::HloSharding::IotaTile({-2, -2})),
+               "does not match");
+}
+
+TEST_P(HloShardingTest, UnknownAndNamedShardingHandling) {
+  DeviceListRef device_list = GetDevices({0, 1});
+  ShardingRef unknown_sharding = HloSharding::Create(
+      device_list, MemoryKind(), xla::HloSharding::Unknown());
+  EXPECT_THAT(unknown_sharding->IndexDomains(
+                  Shape({4}), SingleDeviceShardSemantics::kAllShards),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("Unknown sharding")));
+  EXPECT_THAT(unknown_sharding->Disassemble(
+                  Shape({4}), SingleDeviceShardSemantics::kAllShards),
+              absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                     HasSubstr("Unknown sharding")));
+
+  // V3 NamedSharding leaf works across IndexDomains, Disassemble,
+  // UniqueIndexDomains, and ShardToUniqueIndexDomainIndex.
+  xla::HloSharding v3_sharding =
+      xla::HloSharding::ToV3Sharding(xla::HloSharding::IotaTile({2, 1}));
+  ShardingRef named_sharding =
+      HloSharding::Create(device_list, MemoryKind(), v3_sharding);
+  EXPECT_THAT(named_sharding->IndexDomains(
+                  Shape({4, 6}), SingleDeviceShardSemantics::kAllShards),
+              absl_testing::IsOkAndHolds(
+                  ElementsAre(IndexDomain(Index({0, 0}), Shape({2, 6})),
+                              IndexDomain(Index({2, 0}), Shape({2, 6})))));
+  EXPECT_THAT(
+      named_sharding->sharding_spec()->UniqueIndexDomains(Shape({4, 6})),
+      absl_testing::IsOkAndHolds(ElementsAre(
+          FieldsAre(IndexDomain(Index({0, 0}), Shape({2, 6})), ElementsAre(0)),
+          FieldsAre(IndexDomain(Index({2, 0}), Shape({2, 6})),
+                    ElementsAre(1)))));
+  EXPECT_THAT(named_sharding->sharding_spec()->ShardToUniqueIndexDomainIndex(),
+              absl_testing::IsOkAndHolds(ElementsAre(0, 1)));
 }
 
 INSTANTIATE_TEST_SUITE_P(NumDevices, HloShardingTest,

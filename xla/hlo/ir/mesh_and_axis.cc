@@ -33,20 +33,32 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/array.h"
 #include "xla/hlo/ir/tile_assignment.h"
+#include "xla/overflow_util.h"
 #include "xla/xla_data.pb.h"
 
 namespace xla {
 
 absl::Status Mesh::Validate() {
+  if (device_assignment_.num_dimensions() != axes_names_.size()) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Number of axes names must match number of dimensions in the device "
+        "assignment. Number of axes names: ",
+        axes_names_.size(),
+        ", Number of dimensions: ", device_assignment_.dimensions().size()));
+  }
+
   if (device_assignment_.num_dimensions() == 0) {
     // Empty mesh or single-device mesh.
-    if (device_assignment_.num_elements() <= 1) {
+    if (device_assignment_.num_elements() >= 0 &&
+        device_assignment_.num_elements() <= 1) {
       return absl::OkStatus();
     }
     return absl::InvalidArgumentError(absl::StrCat(
@@ -55,12 +67,17 @@ absl::Status Mesh::Validate() {
         device_assignment_.num_elements()));
   }
 
-  if (device_assignment_.num_dimensions() != axes_names_.size()) {
-    return absl::InvalidArgumentError(absl::StrCat(
-        "Number of axes names must match number of dimensions in the device "
-        "assignment. Number of axes names: ",
-        axes_names_.size(),
-        ", Number of dimensions: ", device_assignment_.dimensions().size()));
+  int64_t num_elements = 1;
+  for (int64_t dim : device_assignment_.dimensions()) {
+    if (dim <= 0) {
+      return absl::InvalidArgumentError("Mesh axis size must be positive.");
+    }
+    auto [next, overflow] = OverflowSafeMultiply(num_elements, dim);
+    if (overflow) {
+      return absl::InvalidArgumentError(
+          "Product of mesh axis sizes overflows int64_t.");
+    }
+    num_elements = next;
   }
 
   absl::flat_hash_set<std::string> seen_axis_names;
@@ -71,8 +88,54 @@ absl::Status Mesh::Validate() {
     }
   }
 
-  // Validate device ids are permutation of iota in non-iota cases.
+  // Validate iota parameters or explicit device id permutation.
   if (device_assignment_.iota().has_value()) {
+    const IotaTileAssignment& iota = *device_assignment_.iota();
+    const absl::Span<const int64_t> reshape_dims = iota.reshape_dims();
+    const absl::Span<const int> transpose_perm = iota.transpose_perm();
+    if (reshape_dims.empty()) {
+      return absl::InvalidArgumentError(
+          "Mesh iota_transform reshape_dims must not be empty.");
+    }
+    if (reshape_dims.size() != transpose_perm.size()) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Mesh iota_transform reshape_dims size (%d) must match "
+          "transpose_perm size (%d).",
+          reshape_dims.size(), transpose_perm.size()));
+    }
+    int64_t reshape_elements = 1;
+    for (int64_t dim : reshape_dims) {
+      if (dim <= 0) {
+        return absl::InvalidArgumentError(
+            "Mesh iota_transform reshape_dims must be positive.");
+      }
+      auto [next, overflow] = OverflowSafeMultiply(reshape_elements, dim);
+      if (overflow) {
+        return absl::InvalidArgumentError(
+            "Product of mesh iota_transform reshape_dims overflows int64_t.");
+      }
+      reshape_elements = next;
+    }
+    if (reshape_elements != num_elements) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Product of mesh iota_transform reshape_dims (%d) must match "
+          "product of mesh axis sizes (%d).",
+          reshape_elements, num_elements));
+    }
+    std::vector<bool> seen_perm(transpose_perm.size(), false);
+    for (int p : transpose_perm) {
+      if (p < 0 || static_cast<size_t>(p) >= transpose_perm.size()) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Mesh iota_transform transpose_perm entry %d out of range "
+            "[0, %d).",
+            p, transpose_perm.size()));
+      }
+      if (seen_perm[p]) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Mesh iota_transform transpose_perm entry %d is not unique.", p));
+      }
+      seen_perm[p] = true;
+    }
     return absl::OkStatus();
   }
   std::vector<int64_t> device_ids(device_assignment_.array().begin(),
@@ -180,57 +243,132 @@ MeshProto Mesh::ToProto() const {
 }
 
 Mesh Mesh::FromProto(const MeshProto& proto) {
+  absl::StatusOr<Mesh> mesh = TryFromProto(proto);
+  CHECK_OK(mesh);
+  return *std::move(mesh);
+}
+
+absl::StatusOr<Mesh> Mesh::TryFromProto(const MeshProto& proto) {
   if (proto.axes_size() == 0) {
+    if (proto.has_iota_transform()) {
+      return absl::InvalidArgumentError(
+          "Mesh without axes must not have an iota transform.");
+    }
     if (proto.device_ids_size() == 0) {
       return Mesh();
     }
-    // Maximal mesh
-    CHECK_EQ(proto.device_ids_size(), 1)
-        << "Maximal mesh must have exactly 1 device id.";
+    if (proto.device_ids_size() != 1) {
+      return absl::InvalidArgumentError(
+          "Maximal mesh must have exactly 1 device id.");
+    }
+    if (proto.device_ids(0) < 0) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Mesh device ids must be non-negative. Device id: ",
+                       proto.device_ids(0)));
+    }
     return Mesh(proto.device_ids(0));
   }
 
   std::vector<int64_t> mesh_axis_sizes;
-  std::vector<absl::string_view> mesh_axis_names;
+  std::vector<std::string> mesh_axis_names;
   mesh_axis_sizes.reserve(proto.axes_size());
   mesh_axis_names.reserve(proto.axes_size());
-  for (const auto& axis : proto.axes()) {
-    CHECK_GT(axis.size(), 0) << "Mesh axis size must be positive.";
+  int64_t num_elements = 1;
+  for (const MeshProto::MeshAxis& axis : proto.axes()) {
+    if (axis.size() <= 0) {
+      return absl::InvalidArgumentError("Mesh axis size must be positive.");
+    }
+    auto [next_product, overflow] =
+        OverflowSafeMultiply(num_elements, axis.size());
+    if (overflow) {
+      return absl::InvalidArgumentError(
+          "Product of mesh axis sizes overflows int64_t.");
+    }
+    num_elements = next_product;
     mesh_axis_sizes.push_back(axis.size());
     mesh_axis_names.push_back(axis.name());
   }
-  absl::Span<const absl::string_view> mesh_axis_names_span =
-      absl::MakeSpan(mesh_axis_names);
+
+  Mesh mesh;
+  mesh.axes_names_ = std::move(mesh_axis_names);
 
   // If device ids are not specified, create a mesh with iota tiling.
   if (proto.device_ids_size() == 0) {
     if (proto.has_iota_transform()) {
-      // Transformed iota.
-      TileAssignment device_assignment = TileAssignment(
-          IotaTileAssignment::Create(mesh_axis_sizes, proto.iota_transform()));
-      return Mesh(device_assignment, mesh_axis_names_span);
+      const MeshProto::IotaTransform& transform = proto.iota_transform();
+      if (transform.reshape_dims().empty()) {
+        return absl::InvalidArgumentError(
+            "Mesh iota_transform reshape_dims must not be empty.");
+      }
+      if (transform.reshape_dims_size() != transform.transpose_perm_size()) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Mesh iota_transform reshape_dims size (%d) must match "
+            "transpose_perm size (%d).",
+            transform.reshape_dims_size(), transform.transpose_perm_size()));
+      }
+      int64_t reshape_elements = 1;
+      for (int64_t dim : transform.reshape_dims()) {
+        if (dim <= 0) {
+          return absl::InvalidArgumentError(
+              "Mesh iota_transform reshape_dims must be positive.");
+        }
+        auto [next_product, overflow] =
+            OverflowSafeMultiply(reshape_elements, dim);
+        if (overflow) {
+          return absl::InvalidArgumentError(
+              "Product of mesh iota_transform reshape_dims overflows int64_t.");
+        }
+        reshape_elements = next_product;
+      }
+      if (reshape_elements != num_elements) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "Product of mesh iota_transform reshape_dims (%d) must match "
+            "product of mesh axis sizes (%d).",
+            reshape_elements, num_elements));
+      }
+      const int perm_size = transform.transpose_perm_size();
+      std::vector<bool> seen_perm(perm_size, false);
+      for (int64_t perm_dim : transform.transpose_perm()) {
+        if (perm_dim < 0 || perm_dim >= perm_size) {
+          return absl::InvalidArgumentError(absl::StrFormat(
+              "Mesh iota_transform transpose_perm entry %d out of range "
+              "[0, %d).",
+              perm_dim, perm_size));
+        }
+        if (seen_perm[perm_dim]) {
+          return absl::InvalidArgumentError(absl::StrFormat(
+              "Mesh iota_transform transpose_perm entry %d is not unique.",
+              perm_dim));
+        }
+        seen_perm[perm_dim] = true;
+      }
+      mesh.device_assignment_ = TileAssignment(
+          IotaTileAssignment::Create(mesh_axis_sizes, transform));
+    } else {
+      mesh.device_assignment_ =
+          TileAssignment(IotaTileAssignment::Create(mesh_axis_sizes));
     }
-    // Simple iota.
-    TileAssignment device_assignment =
-        TileAssignment(IotaTileAssignment::Create(mesh_axis_sizes));
-    return Mesh(device_assignment, mesh_axis_names_span);
+    ABSL_RETURN_IF_ERROR(mesh.Validate());
+    return mesh;
   }
+
   // The proto must not have defined both a device IDs list and have an
   // iota transform, since the iota transform makes no sense in this case.
-  CHECK(!proto.has_iota_transform())
-      << "Mesh must not have an iota transform and a device ID list";
+  if (proto.has_iota_transform()) {
+    return absl::InvalidArgumentError(
+        "Mesh must not have an iota transform and a device ID list");
+  }
 
-  // Otherwise, create a mesh with the specific device id ordering.
-  std::vector<int64_t> device_ids(proto.device_ids().begin(),
-                                  proto.device_ids().end());
+  if (proto.device_ids_size() != num_elements) {
+    return absl::InvalidArgumentError(
+        "Number of device ids must match the product of mesh axis sizes.");
+  }
   Array<int64_t> device_ids_array(mesh_axis_sizes);
-  CHECK_EQ(device_ids.size(), device_ids_array.num_elements())
-      << "Number of device ids must match the product of mesh axis sizes.";
-  absl::c_copy(device_ids, device_ids_array.begin());
-
-  TileAssignment tile_assignment =
-      TileAssignment(std::make_shared<Array<int64_t>>(device_ids_array));
-  return Mesh(tile_assignment, mesh_axis_names_span);
+  absl::c_copy(proto.device_ids(), device_ids_array.begin());
+  mesh.device_assignment_ = TileAssignment(
+      std::make_shared<Array<int64_t>>(std::move(device_ids_array)));
+  ABSL_RETURN_IF_ERROR(mesh.Validate());
+  return mesh;
 }
 
 bool Mesh::ContainsAllMeshAxesInOrder(absl::Span<const AxisRef> axes) const {
@@ -275,10 +413,31 @@ AxisRefProto AxisRef::ToProto() const {
 }
 
 AxisRef AxisRef::FromProto(const AxisRefProto& proto) {
+  absl::StatusOr<AxisRef> axis_ref = TryFromProto(proto);
+  CHECK_OK(axis_ref);
+  return *std::move(axis_ref);
+}
+
+absl::StatusOr<AxisRef> AxisRef::TryFromProto(const AxisRefProto& proto) {
+  if (proto.mesh_axis_index() < 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Axis index must be non-negative. Axis index: ",
+                     proto.mesh_axis_index()));
+  }
   if (proto.has_sub_axis_info()) {
-    return AxisRef(proto.mesh_axis_index(),
-                   SubAxis{proto.sub_axis_info().pre_size(),
-                           proto.sub_axis_info().size()});
+    const int64_t pre_size = proto.sub_axis_info().pre_size();
+    const int64_t size = proto.sub_axis_info().size();
+    if (pre_size < 1) {
+      return absl::InvalidArgumentError("sub-axis pre-size must be >= 1");
+    }
+    if (size <= 1) {
+      return absl::InvalidArgumentError("sub-axis size must be > 1");
+    }
+    if (OverflowSafeMultiply(pre_size, size).second) {
+      return absl::InvalidArgumentError(
+          "sub-axis next_pre_size overflows int64_t");
+    }
+    return AxisRef(proto.mesh_axis_index(), SubAxis{pre_size, size});
   }
   return AxisRef(proto.mesh_axis_index());
 }

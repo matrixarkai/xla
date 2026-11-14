@@ -144,11 +144,17 @@ absl::StatusOr<std::unique_ptr<Sharding>>
 SingleDeviceSharding::WithDeviceAssignment(
     std::optional<DeviceListRef> devices,
     std::optional<MemoryKind> memory_kind) const {
-  if (devices.has_value() && (*devices)->size() != 1) {
-    return absl::InvalidArgumentError(absl::StrFormat(
-        "SingleDeviceSharding can only have one device, but was asked to have "
-        "%d devices",
-        (*devices)->size()));
+  if (devices.has_value()) {
+    if (*devices == nullptr) {
+      return absl::InvalidArgumentError(
+          "SingleDeviceSharding requires a non-null DeviceList");
+    }
+    if ((*devices)->size() != 1) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "SingleDeviceSharding can only have one device, but was asked to "
+          "have %d devices",
+          (*devices)->size()));
+    }
   }
   return std::unique_ptr<Sharding>(new SingleDeviceSharding(
       devices.value_or(devices_), memory_kind.value_or(memory_kind_),
@@ -244,11 +250,17 @@ bool OpaqueSharding::HasSamePartitioning(const Sharding& other) const {
 absl::StatusOr<std::unique_ptr<Sharding>> OpaqueSharding::WithDeviceAssignment(
     std::optional<DeviceListRef> devices,
     std::optional<MemoryKind> memory_kind) const {
-  if (devices.has_value() && (*devices)->size() != devices_->size()) {
-    return absl::InvalidArgumentError(absl::StrFormat(
-        "OpaqueSharding should have the same number of devices as the current "
-        "sharding, but was asked to have %d devices",
-        (*devices)->size()));
+  if (devices.has_value()) {
+    if (*devices == nullptr) {
+      return absl::InvalidArgumentError(
+          "OpaqueSharding requires a non-null DeviceList");
+    }
+    if ((*devices)->size() != devices_->size()) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "OpaqueSharding should have the same number of devices as the "
+          "current sharding, but was asked to have %d devices",
+          (*devices)->size()));
+    }
   }
   return std::unique_ptr<Sharding>(
       new OpaqueSharding(devices.value_or(devices_),
@@ -343,11 +355,17 @@ absl::StatusOr<std::unique_ptr<Sharding>>
 ConcreteSharding::WithDeviceAssignment(
     std::optional<DeviceListRef> devices,
     std::optional<MemoryKind> memory_kind) const {
-  if (devices.has_value() && (*devices)->size() != devices_->size()) {
-    return absl::InvalidArgumentError(absl::StrFormat(
-        "ConcreteSharding should have the same number of devices as the "
-        "current sharding, but was asked to have %d devices",
-        (*devices)->size()));
+  if (devices.has_value()) {
+    if (*devices == nullptr) {
+      return absl::InvalidArgumentError(
+          "ConcreteSharding requires a non-null DeviceList");
+    }
+    if ((*devices)->size() != devices_->size()) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "ConcreteSharding should have the same number of devices as the "
+          "current sharding, but was asked to have %d devices",
+          (*devices)->size()));
+    }
   }
   return std::unique_ptr<Sharding>(
       new ConcreteSharding(devices.value_or(devices_),
@@ -545,11 +563,17 @@ absl::StatusOr<std::unique_ptr<Sharding>>
 ConcreteEvenSharding::WithDeviceAssignment(
     std::optional<DeviceListRef> devices,
     std::optional<MemoryKind> memory_kind) const {
-  if (devices.has_value() && (*devices)->size() != devices_->size()) {
-    return absl::InvalidArgumentError(absl::StrFormat(
-        "ConcreteEvenSharding should have the same number of devices as the "
-        "current sharding, but was asked to have %d devices",
-        (*devices)->size()));
+  if (devices.has_value()) {
+    if (*devices == nullptr) {
+      return absl::InvalidArgumentError(
+          "ConcreteEvenSharding requires a non-null DeviceList");
+    }
+    if ((*devices)->size() != devices_->size()) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "ConcreteEvenSharding should have the same number of devices as the "
+          "current sharding, but was asked to have %d devices",
+          (*devices)->size()));
+    }
   }
   return std::unique_ptr<Sharding>(new ConcreteEvenSharding(
       devices.value_or(devices_), memory_kind.value_or(memory_kind_),

@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/hash/hash.h"
 #include "absl/hash/hash_testing.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/types/span.h"
 #include "xla/array.h"
 #include "xla/array3d.h"
@@ -1647,6 +1648,531 @@ TEST_F(HloShardingTest, UnreducedLeafNumTilesFails) {
                                 /*unreduced_axes=*/{"b"}));
   EXPECT_EQ(subgroup_v3.NumTiles(), 2);
   EXPECT_EQ(subgroup_v3.TotalNumTiles(), 4);
+}
+
+TEST_F(HloShardingTest, FromProtoRejectsDuplicateAndNegativeDevices) {
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: 4
+      tile_assignment_devices: 0
+      tile_assignment_devices: 0
+      tile_assignment_devices: 2
+      tile_assignment_devices: 3
+    )pb");
+    EXPECT_THAT(
+        HloSharding::FromProto(proto),
+        absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               ::testing::HasSubstr("device 0 is not unique")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: 4
+      tile_assignment_devices: 2
+      tile_assignment_devices: 7
+      tile_assignment_devices: 5
+      tile_assignment_devices: 7
+    )pb");
+    EXPECT_THAT(
+        HloSharding::FromProto(proto),
+        absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               ::testing::HasSubstr("device 7 is not unique")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: 2
+      tile_assignment_devices: -1
+      tile_assignment_devices: 0
+    )pb");
+    EXPECT_THAT(
+        HloSharding::FromProto(proto),
+        absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               ::testing::HasSubstr("device -1 is negative")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_devices: -1
+    )pb");
+    EXPECT_THAT(
+        HloSharding::FromProto(proto),
+        absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               ::testing::HasSubstr("device -1 is negative")));
+  }
+
+  // Sparse nonnegative unique device subsets remain valid in HloSharding, and
+  // MAXIMAL continues to allow reserved negative device IDs.
+  {
+    OpSharding sparse_proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: [ 2, 1, 2 ]
+      tile_assignment_devices: [ 2, 3, 5, 7 ]
+    )pb");
+    ASSERT_OK_AND_ASSIGN(HloSharding sparse_sharding,
+                         HloSharding::FromProto(sparse_proto));
+    EXPECT_EQ(sparse_sharding.ToString(), "{devices=[2,1,2]2,3,5,7}");
+  }
+
+  {
+    OpSharding maximal_host_proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: MAXIMAL
+      tile_assignment_devices: -1
+    )pb");
+    ASSERT_OK_AND_ASSIGN(HloSharding maximal_host,
+                         HloSharding::FromProto(maximal_host_proto));
+    EXPECT_TRUE(maximal_host.IsSingleDevice());
+  }
+}
+
+TEST_F(HloShardingTest, FromProtoRejectsDimensionOverflowAndInvalidIota) {
+  // (2^62 + 1) * 4 == 2^64 + 4 wraps around int64_t to 4 if overflow is not
+  // accumulated.
+  {
+    OpSharding proto;
+    proto.set_type(OpSharding::OTHER);
+    proto.add_tile_assignment_dimensions(4611686018427387905LL);
+    proto.add_tile_assignment_dimensions(4);
+    for (int i = 0; i < 4; ++i) {
+      proto.add_tile_assignment_devices(i);
+    }
+    EXPECT_THAT(HloSharding::FromProto(proto),
+                absl_testing::StatusIs(absl::StatusCode::kInternal,
+                                       ::testing::HasSubstr("!any_overflow")));
+  }
+
+  {
+    OpSharding proto;
+    proto.set_type(OpSharding::OTHER);
+    proto.add_tile_assignment_dimensions(4);
+    proto.add_iota_reshape_dims(4611686018427387905LL);
+    proto.add_iota_reshape_dims(4);
+    proto.add_iota_transpose_perm(0);
+    proto.add_iota_transpose_perm(1);
+    EXPECT_THAT(HloSharding::FromProto(proto),
+                absl_testing::StatusIs(absl::StatusCode::kInternal,
+                                       ::testing::HasSubstr("!any_overflow")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: 4
+      iota_reshape_dims: [ -2, -2 ]
+      iota_transpose_perm: [ 0, 1 ]
+    )pb");
+    EXPECT_THAT(
+        HloSharding::FromProto(proto),
+        absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               ::testing::HasSubstr("iota_reshape_dims")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: 4
+      iota_reshape_dims: [ 2, 2 ]
+      iota_transpose_perm: [ 99, 0 ]
+    )pb");
+    EXPECT_THAT(
+        HloSharding::FromProto(proto),
+        absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               ::testing::HasSubstr("iota_transpose_perm")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: 6
+      iota_reshape_dims: [ 2, 3 ]
+      iota_transpose_perm: [ 0, 0 ]
+    )pb");
+    EXPECT_THAT(HloSharding::FromProto(proto),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("not unique")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: 1
+      iota_reshape_dims: [ 1, 1 ]
+      iota_transpose_perm: [ -1, 0 ]
+    )pb");
+    EXPECT_THAT(
+        HloSharding::FromProto(proto),
+        absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               ::testing::HasSubstr("iota_transpose_perm")));
+  }
+}
+
+TEST_F(HloShardingTest, FromProtoRejectsInvalidSubgroupAndNamedSharding) {
+  {
+    OpSharding proto;
+    proto.set_type(OpSharding::OTHER);
+    proto.add_tile_assignment_dimensions(2);
+    proto.add_tile_assignment_dimensions(2);
+    for (int i = 0; i < 4; ++i) {
+      proto.add_tile_assignment_devices(i);
+    }
+    proto.mutable_last_tile_dims()->Add(12345);
+    EXPECT_THAT(HloSharding::FromProto(proto),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    ::testing::HasSubstr("Invalid subgroup sharding type")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: [ 2, 2 ]
+      tile_assignment_devices: [ 0, 1, 2, 3 ]
+      last_tile_dims: [ TUPLE ]
+    )pb");
+    EXPECT_THAT(
+        HloSharding::FromProto(proto),
+        absl_testing::StatusIs(
+            absl::StatusCode::kInvalidArgument,
+            ::testing::HasSubstr("Unsupported subgroup sharding type")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      named_sharding {
+        mesh {
+          axes { name: "a" size: 4 }
+          iota_transform {
+            reshape_dims: [ 2, 2 ]
+            transpose_perm: [ 999, 0 ]
+          }
+        }
+      }
+    )pb");
+    EXPECT_THAT(HloSharding::FromProto(proto),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("transpose_perm")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      named_sharding {
+        mesh { axes { name: "a" size: 8 } }
+        dim_shardings {
+          axes {
+            mesh_axis_index: 0
+            sub_axis_info { pre_size: 4611686018427387904 size: 4 }
+          }
+          is_closed: true
+        }
+      }
+    )pb");
+    EXPECT_THAT(HloSharding::FromProto(proto),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("overflows")));
+  }
+}
+
+TEST_F(HloShardingTest, EachTileRejectsDuplicatesAndNonReplicatedSubgroup) {
+  HloSharding duplicate_sharding =
+      HloSharding::Tile(Array<int64_t>({4}, {0, 0, 2, 3}));
+  EXPECT_THAT(
+      duplicate_sharding.EachTile(
+          /*dims=*/{5},
+          [](int64_t, absl::Span<const int64_t>, absl::Span<const int64_t>) {}),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                             ::testing::HasSubstr("Duplicate device id")));
+
+  HloSharding manual_subgroup_sharding =
+      HloSharding::Subgroup(TileAssignment({2, 2}), {OpSharding::MANUAL});
+  EXPECT_THAT(
+      manual_subgroup_sharding.EachTile(
+          /*dims=*/{4},
+          [](int64_t, absl::Span<const int64_t>, absl::Span<const int64_t>) {}),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                             ::testing::HasSubstr("non-replicated subgroups")));
+
+  // Large shape dimensions near INT64_MAX must clamp without signed overflow.
+  HloSharding iota_3 = HloSharding::IotaTile({3});
+  std::vector<int64_t> offsets(3);
+  std::vector<int64_t> limits(3);
+  constexpr int64_t kMaxDim = 9223372036854775807LL;
+  EXPECT_OK(iota_3.EachTile(
+      /*dims=*/{kMaxDim}, [&](int64_t device, absl::Span<const int64_t> offset,
+                              absl::Span<const int64_t> limit) {
+        offsets[device] = offset[0];
+        limits[device] = limit[0];
+      }));
+  EXPECT_EQ(offsets[2], 6148914691236517206LL);
+  EXPECT_EQ(limits[2], kMaxDim);
+
+  // V3 NamedSharding with size 1 manual axis or size 1 sharded axis must not
+  // crash EachTile or TileOffsetForDevice when V3ToV2Sharding normalizes to
+  // Replicate.
+  {
+    OpSharding size1_manual_proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      named_sharding {
+        mesh {
+          axes { name: "a" size: 1 }
+          axes { name: "b" size: 2 }
+        }
+        dim_shardings { is_closed: true }
+        manual_axes { mesh_axis_index: 0 }
+      }
+    )pb");
+    ASSERT_OK_AND_ASSIGN(HloSharding size1_manual,
+                         HloSharding::FromProto(size1_manual_proto));
+    EXPECT_THAT(size1_manual.EachTile(
+                    /*dims=*/{5}, [](int64_t, absl::Span<const int64_t>,
+                                     absl::Span<const int64_t>) {}),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    ::testing::HasSubstr("non-replicated subgroups")));
+    Shape f32_5 = ShapeUtil::MakeShape(F32, {5});
+    EXPECT_THAT(size1_manual.TileIndexForDevice(0), ::testing::ElementsAre(0));
+    EXPECT_THAT(size1_manual.TileOffsetForDevice(f32_5, 0),
+                ::testing::ElementsAre(0));
+    EXPECT_THAT(size1_manual.TileLimitForDevice(f32_5, 0),
+                ::testing::ElementsAre(5));
+  }
+
+  {
+    OpSharding size1_sharded_proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      named_sharding {
+        mesh {
+          axes { name: "a" size: 1 }
+          axes { name: "b" size: 2 }
+        }
+        dim_shardings {
+          axes { mesh_axis_index: 0 }
+          is_closed: true
+        }
+      }
+    )pb");
+    ASSERT_OK_AND_ASSIGN(HloSharding size1_sharded,
+                         HloSharding::FromProto(size1_sharded_proto));
+    EXPECT_TRUE(size1_sharded.IsReplicated());
+    Shape f32_5 = ShapeUtil::MakeShape(F32, {5});
+    EXPECT_THAT(size1_sharded.TileOffsetForDevice(f32_5, 0),
+                ::testing::ElementsAre(0));
+    EXPECT_THAT(size1_sharded.TileLimitForDevice(f32_5, 0),
+                ::testing::ElementsAre(5));
+  }
+}
+
+TEST_F(HloShardingTest,
+       FromProtoRejectsNestedTupleLargePrimeHangAndIotaMaterialization) {
+  // Nested TUPLE OpSharding is invalid.
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: TUPLE
+      tuple_shardings { type: TUPLE }
+    )pb");
+    EXPECT_THAT(HloSharding::FromProto(proto),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("Nested tuple")));
+  }
+
+  // TUPLE with sdy::reduction_op metadata is rejected.
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: TUPLE
+      metadata { op_type: "sdy::reduction_op" op_name: "MAX" }
+    )pb");
+    EXPECT_THAT(
+        HloSharding::FromProto(proto),
+        absl_testing::StatusIs(absl::StatusCode::kInternal,
+                               ::testing::HasSubstr("metadata.empty()")));
+  }
+
+  // Large prime in iota_reshape_dims must not overflow 32 bit int or hang in
+  // FullyDecanonicalize: canonical transposes succeed immediately, while
+  // noncanonical iota fallback above the device cap returns
+  // InvalidArgumentError instead of allocating petabytes.
+  {
+    OpSharding canonical_prime_proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: [ 2147483647, 2, 3 ]
+      iota_reshape_dims: [ 6, 2147483647 ]
+      iota_transpose_perm: [ 1, 0 ]
+      last_tile_dims: [ REPLICATED, MANUAL ]
+    )pb");
+    ASSERT_OK_AND_ASSIGN(HloSharding sharding,
+                         HloSharding::FromProto(canonical_prime_proto));
+    EXPECT_EQ(sharding.num_devices(), 6LL * 2147483647LL);
+  }
+
+  {
+    OpSharding noncanonical_prime_proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: [ 2, 3, 2147483647 ]
+      iota_reshape_dims: [ 6, 2147483647 ]
+      iota_transpose_perm: [ 1, 0 ]
+      last_tile_dims: [ REPLICATED, MANUAL ]
+    )pb");
+    EXPECT_THAT(HloSharding::FromProto(noncanonical_prime_proto),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    ::testing::HasSubstr("Refusing to materialize")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: [ 3000000000, 2000000000 ]
+      iota_reshape_dims: [ 3000000000, 2000000000 ]
+      iota_transpose_perm: [ 1, 0 ]
+      replicate_on_last_tile_dim: true
+    )pb");
+    EXPECT_THAT(HloSharding::FromProto(proto),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    ::testing::HasSubstr("Refusing to materialize")));
+  }
+
+  {
+    OpSharding proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: [ 2, 3, 1000000000000001 ]
+      iota_reshape_dims: [ 6, 1000000000000001 ]
+      iota_transpose_perm: [ 1, 0 ]
+      last_tile_dims: [ REPLICATED, MANUAL ]
+    )pb");
+    EXPECT_THAT(HloSharding::FromProto(proto),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    ::testing::HasSubstr("Refusing to materialize")));
+  }
+
+  // V3 NamedSharding with noncanonical iota_transform above the materialization
+  // cap is rejected in FromProto, and EachTile rejects huge device counts.
+  {
+    OpSharding v3_noncanonical_partial = ParseTextProtoOrDie<OpSharding>(R"pb(
+      named_sharding {
+        mesh {
+          axes { name: "a" size: 3000000000 }
+          axes { name: "b" size: 2000000000 }
+          iota_transform {
+            reshape_dims: [ 3000000000, 2000000000 ]
+            transpose_perm: [ 1, 0 ]
+          }
+        }
+        dim_shardings {
+          axes { mesh_axis_index: 0 }
+          is_closed: true
+        }
+      }
+    )pb");
+    EXPECT_THAT(HloSharding::FromProto(v3_noncanonical_partial),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    ::testing::HasSubstr("Refusing to materialize")));
+
+    OpSharding v3_noncanonical_transpose = ParseTextProtoOrDie<OpSharding>(R"pb(
+      named_sharding {
+        mesh {
+          axes { name: "a" size: 2000000000 }
+          axes { name: "b" size: 3000000000 }
+          iota_transform {
+            reshape_dims: [ 2000000000, 3000000000 ]
+            transpose_perm: [ 1, 0 ]
+          }
+        }
+        dim_shardings {
+          axes { mesh_axis_index: 1 }
+          is_closed: true
+        }
+        dim_shardings {
+          axes { mesh_axis_index: 0 }
+          is_closed: true
+        }
+      }
+    )pb");
+    EXPECT_THAT(HloSharding::FromProto(v3_noncanonical_transpose),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    ::testing::HasSubstr("Refusing to materialize")));
+  }
+
+  // 64 bit reshape dimension >= 2^32 in IotaTileAssignment::value_at must not
+  // truncate to 32 bit int or divide by zero, and EachTile rejects huge counts.
+  {
+    OpSharding large_iota_proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      type: OTHER
+      tile_assignment_dimensions: [ 4294967296 ]
+      iota_reshape_dims: [ 4294967296 ]
+      iota_transpose_perm: [ 0 ]
+    )pb");
+    ASSERT_OK_AND_ASSIGN(HloSharding large_iota,
+                         HloSharding::FromProto(large_iota_proto));
+    EXPECT_EQ(large_iota.tile_assignment()({0}), 0);
+    EXPECT_EQ(large_iota.tile_assignment()({4294967295LL}), 4294967295LL);
+    EXPECT_THAT(
+        large_iota.EachTile(
+            /*dims=*/{4}, [](int64_t, absl::Span<const int64_t>,
+                             absl::Span<const int64_t>) {}),
+        absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               ::testing::HasSubstr("exceeds maximum")));
+    // Comparing a huge iota TileAssignment against a small explicit
+    // TileAssignment short circuits on dimensions without materializing array.
+    TileAssignment small_explicit(std::make_shared<const Array<int64_t>>(
+        std::initializer_list<int64_t>{2},
+        std::initializer_list<int64_t>{1, 0}));
+    EXPECT_NE(large_iota.tile_assignment(), small_explicit);
+  }
+
+  // Size 1 manual and unreduced subgroup axes in V3 NamedSharding normalize
+  // cleanly in V3ToV2Sharding, and Validate handles token and opaque shapes.
+  {
+    OpSharding scalar_manual_proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      named_sharding {
+        mesh {
+          axes { name: "a" size: 1 }
+          axes { name: "b" size: 1 }
+        }
+        unreduced_axes { mesh_axis_index: 1 }
+        manual_axes { mesh_axis_index: 0 }
+      }
+    )pb");
+    ASSERT_OK_AND_ASSIGN(HloSharding scalar_manual,
+                         HloSharding::FromProto(scalar_manual_proto));
+    EXPECT_EQ(scalar_manual, HloSharding::Manual());
+
+    OpSharding unreduced_norm_proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+      named_sharding {
+        mesh {
+          axes { name: "a" size: 1 }
+          axes { name: "b" size: 2 }
+        }
+        dim_shardings { is_closed: true }
+        unreduced_axes { mesh_axis_index: 1 }
+        manual_axes { mesh_axis_index: 0 }
+      }
+    )pb");
+    ASSERT_OK_AND_ASSIGN(HloSharding unreduced_norm,
+                         HloSharding::FromProto(unreduced_norm_proto));
+    EXPECT_EQ(unreduced_norm, HloSharding::Unreduced());
+
+    Shape tuple_with_token = ShapeUtil::MakeTupleShape(
+        {ShapeUtil::MakeShape(F32, {8}), ShapeUtil::MakeTokenShape()});
+    HloSharding tuple_sharding =
+        HloSharding::SingleTuple(tuple_with_token, HloSharding::IotaTile({2}));
+    EXPECT_OK(tuple_sharding.Validate(tuple_with_token, /*num_devices=*/2));
+    EXPECT_THAT(
+        HloSharding::IotaTile({2}).Validate(ShapeUtil::MakeOpaqueShape(), 2),
+        absl_testing::StatusIs(
+            absl::StatusCode::kInvalidArgument,
+            ::testing::HasSubstr("requires an array shape")));
+
+    Shape unbounded_dyn =
+        ShapeUtil::MakeShape(F32, {Shape::kUnboundedSize, 8}, {true, false});
+    Shape tiled_dyn = HloSharding::IotaTile({2, 2}).TileShape(unbounded_dyn);
+    EXPECT_TRUE(tiled_dyn.is_unbounded_dynamic_dimension(0));
+    EXPECT_EQ(tiled_dyn.dimensions(1), 4);
+  }
 }
 
 }  // namespace

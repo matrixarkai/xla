@@ -77,9 +77,10 @@ class HloShardingSerDes : public RTTIExtends<HloSharding, SerDes> {
       std::unique_ptr<DeserializeOptions> options) override {
     const auto* deserialize_sharding_options =
         dyn_cast_or_null<DeserializeShardingOptions>(options.get());
-    if (deserialize_sharding_options == nullptr) {
+    if (deserialize_sharding_options == nullptr ||
+        deserialize_sharding_options->client == nullptr) {
       return absl::InvalidArgumentError(
-          "DeserializeShardingOptions must be provided");
+          "DeserializeShardingOptions with non-null client must be provided");
     }
 
     HloShardingProto proto;
@@ -93,15 +94,32 @@ class HloShardingSerDes : public RTTIExtends<HloSharding, SerDes> {
           "Unsupported ", version_number, " for HloSharding deserialization"));
     }
     ABSL_ASSIGN_OR_RETURN(
-        auto devices,
+        DeviceListRef devices,
         DeviceList::FromProto(deserialize_sharding_options->client,
                               proto.devices()));
+    if (devices->devices().empty()) {
+      return absl::InvalidArgumentError(
+          "HloSharding requires at least one device");
+    }
     MemoryKind memory_kind;
     if (proto.has_memory_kind()) {
       memory_kind = MemoryKind(proto.memory_kind());
     }
-    ABSL_ASSIGN_OR_RETURN(auto xla_hlo_sharding,
+    ABSL_ASSIGN_OR_RETURN(xla::HloSharding xla_hlo_sharding,
                           xla::HloSharding::FromProto(proto.xla_op_sharding()));
+    if (xla_hlo_sharding.IsTuple()) {
+      return absl::InvalidArgumentError(
+          "Tuple HloSharding is not supported for deserialization");
+    }
+    if (!xla_hlo_sharding.IsReplicated() && !xla_hlo_sharding.IsUnreduced() &&
+        xla_hlo_sharding.IsTiled() &&
+        devices->size() != xla_hlo_sharding.num_devices()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "`num_shards` and `xla_hlo_sharding`'s `num_devices` does not "
+          "match: ",
+          devices->size(), " vs. ", xla_hlo_sharding.num_devices(),
+          "; sharding=", xla_hlo_sharding.ToString()));
+    }
     return HloSharding::Create(std::move(devices), memory_kind,
                                std::move(xla_hlo_sharding));
   }

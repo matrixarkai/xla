@@ -84,11 +84,17 @@ bool HloSharding::HasSamePartitioning(const Sharding& other) const {
 absl::StatusOr<std::unique_ptr<Sharding>> HloSharding::WithDeviceAssignment(
     std::optional<DeviceListRef> devices,
     std::optional<MemoryKind> memory_kind) const {
-  if (devices.has_value() && (*devices)->size() != devices_->size()) {
-    return absl::InvalidArgumentError(absl::StrFormat(
-        "HloSharding should have the same number of devices as the current "
-        "sharding, but was asked to have %d devices",
-        (*devices)->size()));
+  if (devices.has_value()) {
+    if (*devices == nullptr) {
+      return absl::InvalidArgumentError(
+          "HloSharding requires a non-null DeviceList");
+    }
+    if ((*devices)->size() != devices_->size()) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "HloSharding should have the same number of devices as the current "
+          "sharding, but was asked to have %d devices",
+          (*devices)->size()));
+    }
   }
   return std::unique_ptr<Sharding>(
       new HloSharding(devices.value_or(devices_),
@@ -99,6 +105,12 @@ absl::StatusOr<std::vector<std::pair<Shape, ShardingRef>>>
 HloSharding::Disassemble(
     const Shape& shape,
     SingleDeviceShardSemantics single_device_shard_semantics) const {
+  for (int64_t dim : shape.dims()) {
+    if (dim < 0) {
+      return absl::InvalidArgumentError(absl::StrFormat(
+          "Shape dimensions must be nonnegative: shape=%v", shape));
+    }
+  }
   bool is_even_sharding = false;
   if (xla_hlo_sharding().IsReplicatedOrSingleDevice() ||
       xla_hlo_sharding().IsUnreduced()) {
@@ -111,6 +123,13 @@ HloSharding::Disassemble(
           "shape=%v, sharding=%s",
           tiled_data_rank, shape.dims().size(), shape,
           xla_hlo_sharding().ToString()));
+    }
+    for (int64_t sharding_dim : xla_hlo_sharding().dimensions()) {
+      if (sharding_dim <= 0) {
+        return absl::InvalidArgumentError(absl::StrFormat(
+            "HloSharding tile dimensions must be positive, got %d; sharding=%s",
+            sharding_dim, xla_hlo_sharding().ToString()));
+      }
     }
 
     is_even_sharding = true;

@@ -207,9 +207,17 @@ class BoundedDynamicShapeTagSerDesTest : public ShapeSerDesTest {};
 TEST_P(BoundedDynamicShapeTagSerDesTest, ToFromProto) {
   BoundedDynamicShapeTag tag({true, false});
   BoundedDynamicShapeTagProto proto = tag.ToProto(version());
-  TF_ASSERT_OK_AND_ASSIGN(BoundedDynamicShapeTag tag_copy,
-                          tag.FromProto(proto));
+  ASSERT_OK_AND_ASSIGN(BoundedDynamicShapeTag tag_copy,
+                       BoundedDynamicShapeTag::FromProto(proto));
   EXPECT_EQ(tag_copy, tag);
+
+  BoundedDynamicShapeTagProto invalid_proto;
+  invalid_proto.set_version_number(0);
+  invalid_proto.add_is_dynamic_dims(false);
+  EXPECT_THAT(BoundedDynamicShapeTag::FromProto(invalid_proto),
+              absl_testing::StatusIs(
+                  absl::StatusCode::kInvalidArgument,
+                  HasSubstr("At least one dimension needs to be dynamically")));
 }
 
 INSTANTIATE_TEST_SUITE_P(

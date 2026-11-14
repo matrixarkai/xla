@@ -21,21 +21,23 @@ limitations under the License.
 #include <utility>
 
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_sharding.h"
+#include "xla/python/ifrt/basic_device_list.h"
 #include "xla/python/ifrt/client.h"
 #include "xla/python/ifrt/device_list.h"
 #include "xla/python/ifrt/device_test_util.h"
 #include "xla/python/ifrt/memory.h"
 #include "xla/python/ifrt/serdes.h"
+#include "xla/python/ifrt/serdes.pb.h"
 #include "xla/python/ifrt/serdes_test_util.h"
 #include "xla/python/ifrt/serdes_version.h"
 #include "xla/python/ifrt/sharding.h"
 #include "xla/python/pjrt_ifrt/xla_sharding.h"
 #include "xla/python/pjrt_ifrt/xla_sharding.pb.h"
-#include "xla/tsl/platform/status_matchers.h"
-#include "xla/tsl/platform/statusor.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace ifrt {
@@ -43,7 +45,6 @@ namespace {
 
 using ::testing::ElementsAreArray;
 using ::testing::HasSubstr;
-using ::tsl::testing::StatusIs;
 
 using XlaShardingSerDesTestParam =
     std::tuple<SerDesVersion, test_util::DeviceTestParam>;
@@ -73,10 +74,10 @@ TEST_P(XlaShardingSerDesTest, HloShardingRoundTrip) {
                                       /*xla_hlo_sharding=*/xla_hlo_sharding);
 
   auto options = std::make_unique<SerializeOptions>(version());
-  TF_ASSERT_OK_AND_ASSIGN(auto serialized,
-                          Serialize(*sharding, std::move(options)));
+  ASSERT_OK_AND_ASSIGN(auto serialized,
+                       Serialize(*sharding, std::move(options)));
 
-  TF_ASSERT_OK_AND_ASSIGN(
+  ASSERT_OK_AND_ASSIGN(
       auto out_sharding,
       Deserialize<HloSharding>(
           serialized, std::make_unique<DeserializeShardingOptions>(client())));
@@ -100,6 +101,77 @@ TEST_P(XlaShardingSerDesTest, RejectHloShardingV3Serialization) {
           absl::StatusCode::kInvalidArgument,
           HasSubstr(
               "XLA HloShardingV3 format is not supported for serialization")));
+}
+
+TEST_P(XlaShardingSerDesTest, RejectMalformedDeserializationPayloads) {
+  auto wrap_proto = [](const HloShardingProto& proto) {
+    Serialized outer;
+    outer.set_type_name("xla::ifrt::HloSharding");
+    outer.set_data(proto.SerializeAsString());
+    return outer;
+  };
+
+  // Duplicate tile_assignment_devices.
+  {
+    HloShardingProto proto;
+    proto.set_version_number(0);
+    GetDevices({0, 1, 0, 1})->ToProto(*proto.mutable_devices(), version());
+    xla::OpSharding* op = proto.mutable_xla_op_sharding();
+    op->set_type(xla::OpSharding::OTHER);
+    op->add_tile_assignment_dimensions(4);
+    op->add_tile_assignment_devices(0);
+    op->add_tile_assignment_devices(0);
+    op->add_tile_assignment_devices(2);
+    op->add_tile_assignment_devices(3);
+    EXPECT_THAT(Deserialize<HloSharding>(
+                    wrap_proto(proto),
+                    std::make_unique<DeserializeShardingOptions>(client())),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("not unique")));
+  }
+
+  // Empty device list.
+  {
+    HloShardingProto proto;
+    proto.set_version_number(0);
+    BasicDeviceList::Create({})->ToProto(*proto.mutable_devices(), version());
+    proto.mutable_xla_op_sharding()->set_type(xla::OpSharding::REPLICATED);
+    EXPECT_THAT(Deserialize<HloSharding>(
+                    wrap_proto(proto),
+                    std::make_unique<DeserializeShardingOptions>(client())),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("at least one device")));
+  }
+
+  // Mismatched device count vs tile_assignment num_devices.
+  {
+    HloShardingProto proto;
+    proto.set_version_number(0);
+    GetDevices({0})->ToProto(*proto.mutable_devices(), version());
+    *proto.mutable_xla_op_sharding() =
+        xla::HloSharding::IotaTile({2}).ToProto();
+    EXPECT_THAT(Deserialize<HloSharding>(
+                    wrap_proto(proto),
+                    std::make_unique<DeserializeShardingOptions>(client())),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("does not match")));
+  }
+
+  // Tuple OpSharding.
+  {
+    HloShardingProto proto;
+    proto.set_version_number(0);
+    GetDevices({0, 1})->ToProto(*proto.mutable_devices(), version());
+    *proto.mutable_xla_op_sharding() =
+        xla::HloSharding::FlatTuple(
+            {xla::HloSharding::Replicate(), xla::HloSharding::Manual()})
+            .ToProto();
+    EXPECT_THAT(Deserialize<HloSharding>(
+                    wrap_proto(proto),
+                    std::make_unique<DeserializeShardingOptions>(client())),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("Tuple HloSharding")));
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(

@@ -93,7 +93,12 @@ class HloShardingSpec final
   HloShardingSpec(const HloShardingSpec& other);
 
  private:
+  friend std::vector<IndexDomain> TEST_HloShardingSpecIndexDomainsSlowPath(
+      const HloShardingSpec& sharding_spec, const Shape& shape);
+
   HloShardingSpec(int num_shards, xla::HloSharding xla_hlo_sharding);
+
+  absl::Status ValidateTileAssignment() const;
 
   std::string DebugString() const override;
 

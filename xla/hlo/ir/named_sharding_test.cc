@@ -21,6 +21,8 @@ limitations under the License.
 #include <optional>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "xla/hlo/ir/mesh_and_axis.h"
 #include "xla/hlo/ir/tile_assignment.h"
 #include "xla/tsl/lib/core/status_test_util.h"
@@ -1000,6 +1002,35 @@ TEST(NamedShardingTest,
                                 /*unreduced_axes=*/{"b:(3)3"})
           .GetImplicitlyReplicatedAxes(),
       ElementsAre(AxisRef(0, {1, 2}), AxisRef(0, {4, 2}), AxisRef(1, {1, 3})));
+}
+
+TEST(NamedShardingTest, TryFromProtoRejectsInvalidProtos) {
+  {
+    NamedShardingProto::DimensionSharding dim_proto;
+    dim_proto.add_axes()->set_mesh_axis_index(-1);
+    EXPECT_THAT(NamedSharding::DimensionSharding::TryFromProto(dim_proto),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    ::testing::HasSubstr("Axis index must be non-negative")));
+  }
+
+  {
+    NamedShardingProto proto = NamedSharding(Mesh({2}, {"a"})).ToProto();
+    proto.add_dim_shardings()->add_axes()->set_mesh_axis_index(5);
+    EXPECT_THAT(NamedSharding::TryFromProto(proto),
+                absl_testing::StatusIs(
+                    absl::StatusCode::kInvalidArgument,
+                    ::testing::HasSubstr("less than number of axes")));
+  }
+
+  {
+    NamedShardingProto proto = NamedSharding(Mesh({2}, {"a"})).ToProto();
+    proto.add_dim_shardings()->add_axes()->set_mesh_axis_index(0);
+    proto.add_replicated_axes()->set_mesh_axis_index(0);
+    EXPECT_THAT(NamedSharding::TryFromProto(proto),
+                absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       ::testing::HasSubstr("overlap")));
+  }
 }
 
 }  // namespace

@@ -216,6 +216,8 @@ ifrt_proxy_cc_test(
         "//xla/python/ifrt_proxy/common:types_proto_cc",
         "//xla/python/ifrt_proxy/common:versions",
         "//xla/python/pjrt_ifrt:xla_ifrt",
+        "//xla/python/pjrt_ifrt:xla_sharding_proto_cc",
+        "//xla/python/pjrt_ifrt:xla_sharding_serdes",
         "//xla/service:device_assignment",
         "//xla/tsl/concurrency:future",
         "//xla/tsl/concurrency:ref_count",
