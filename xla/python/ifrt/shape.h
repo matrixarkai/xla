@@ -19,6 +19,7 @@ limitations under the License.
 #include <stdbool.h>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -29,6 +30,7 @@ limitations under the License.
 #include "absl/base/nullability.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/log/check.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
@@ -48,10 +50,22 @@ class Shape {
   // Maximum dimensions to inline.
   static constexpr int kInlineDimensionSize = 6;
 
+  // Maximum number of elements such that bit-size calculations (e.g.,
+  // `(num_elements() * *dtype.bit_size() + 7) / 8` in `CompactLayout::ByteSize`
+  // for 128-bit `DType::kC128`) fit in `int64_t` without overflow.
+  static constexpr int64_t kMaxNumElements =
+      std::numeric_limits<int64_t>::max() / 128;
+
   using Dimensions = absl::InlinedVector<int64_t, kInlineDimensionSize>;
 
-  explicit Shape(absl::Span<const int64_t> dims)
-      : dims_(std::make_shared<Dimensions>(dims.begin(), dims.end())) {}
+  // Constructs a `Shape` from `dims`. Returns `InvalidArgumentError` if any
+  // dimension size is negative or if any prefix product of `dims` exceeds
+  // `kMaxNumElements`.
+  static absl::StatusOr<Shape> Create(absl::Span<const int64_t> dims);
+
+  // Constructs a `Shape` from `dims`. `CHECK`-fails if `Create(dims)` returns
+  // an error.
+  explicit Shape(absl::Span<const int64_t> dims);
 
   Shape(const Shape&) = default;
   Shape(Shape&&) = default;
@@ -84,15 +98,9 @@ class Shape {
   template <typename H>
   friend H AbslHashValue(H h, const Shape& shape);
 
-  // Total number of elements in this shape. `CHECK`-fails if any dimension size
-  // is negative or the total number of elements overflows `int64_t`. Use
-  // `NumElements` to handle such an error without `CHECK` failure.
+  // Total number of elements in this shape. Guaranteed to be in
+  // `[0, kMaxNumElements]`.
   int64_t num_elements() const;
-
-  // Returns the total number of elements in this shape, or
-  // `InvalidArgumentError` if any dimension size is negative or the total
-  // number of elements overflows `int64_t`.
-  absl::StatusOr<int64_t> NumElements() const;
 
   template <typename Sink>
   friend void AbslStringify(Sink& sink, const Shape& shape) {
@@ -100,6 +108,10 @@ class Shape {
   }
 
  private:
+  struct UncheckedTag {};
+  Shape(UncheckedTag, absl_nonnull std::shared_ptr<const Dimensions> dims)
+      : dims_(std::move(dims)) {}
+
   absl_nonnull std::shared_ptr<const Dimensions> dims_;
 };
 
