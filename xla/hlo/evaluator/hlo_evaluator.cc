@@ -3906,15 +3906,22 @@ absl::StatusOr<Literal> TryParseAndEvaluateWhileInductionVar(
     const HloInstruction* while_hlo) {
   std::optional<ParsedWhileLoop> parsed_while_loop =
       PatternMatchParseWhileLoop(while_hlo, /*precomputed_analyses=*/{});
-  if (!parsed_while_loop.has_value() || parsed_while_loop->is_dynamic()) {
+  if (!parsed_while_loop.has_value() || parsed_while_loop->is_dynamic() ||
+      parsed_while_loop->static_while_loop->trip_count < 0 ||
+      !while_hlo->shape().IsTuple() ||
+      parsed_while_loop->static_while_loop->induction_var_index < 0 ||
+      parsed_while_loop->static_while_loop->induction_var_index >=
+          ShapeUtil::TupleElementCount(while_hlo->shape())) {
     return absl::FailedPreconditionError(
         "Cannot evaluate a while loop's induction variable since the loop "
         "does not match a known loop pattern or the loop is not static.");
   }
-  int64_t induction_var_value =
-      parsed_while_loop->static_while_loop->induction_var_init_value +
-      parsed_while_loop->static_while_loop->trip_count *
-          parsed_while_loop->static_while_loop->step_size;
+  int64_t induction_var_value = static_cast<int64_t>(
+      static_cast<uint64_t>(
+          parsed_while_loop->static_while_loop->induction_var_init_value) +
+      static_cast<uint64_t>(parsed_while_loop->static_while_loop->trip_count) *
+          static_cast<uint64_t>(
+              parsed_while_loop->static_while_loop->step_size));
   Shape result_shape = while_hlo->shape().tuple_shapes(
       parsed_while_loop->static_while_loop->induction_var_index);
   ABSL_ASSIGN_OR_RETURN(
@@ -3951,6 +3958,7 @@ absl::Status HloEvaluator::HandleWhile(const HloInstruction* while_hlo) {
     Literal literal =
         Literal::CreateFromShapeWithUnknownLeafArrays(while_hlo->shape());
     if (!parsed_while_loop.has_value() || parsed_while_loop->is_dynamic() ||
+        parsed_while_loop->static_while_loop->trip_count < 0 ||
         visitor_shape_index_.size() != 1 ||
         parsed_while_loop->static_while_loop->induction_var_index !=
             visitor_shape_index_[0]) {
