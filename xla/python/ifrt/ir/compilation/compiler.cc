@@ -22,6 +22,7 @@ limitations under the License.
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/cord.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -32,6 +33,7 @@ limitations under the License.
 #include "xla/python/ifrt/executable.h"
 #include "xla/python/ifrt/ir/compilation/atom_program_compiler.h"
 #include "xla/python/ifrt/ir/compilation/compiled_ifrt_ir_program.h"
+#include "xla/python/ifrt/ir/ifrt_ir_executable.h"
 #include "xla/python/ifrt/ir/ifrt_ir_executable_version.h"
 #include "xla/python/ifrt/ir/ifrt_ir_loaded_executable.h"
 #include "xla/python/ifrt/ir/ifrt_ir_program.h"
@@ -40,10 +42,10 @@ limitations under the License.
 #include "xla/python/ifrt/program.h"
 #include "xla/python/ifrt/rtti.h"
 #include "xla/python/ifrt/topology.h"
+#include "xla/python/ifrt/with_user_context.h"
 #include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/errors.h"
-#include "xla/tsl/platform/statusor.h"
 #include "xla/util.h"
 
 namespace xla {
@@ -126,8 +128,37 @@ tsl::Future<LoadedExecutableRef> IfrtIrProgramCompiler::CompileAndLoad(
 tsl::Future<ExecutableRef> IfrtIrProgramCompiler::Compile(
     std::unique_ptr<Program> program, const Topology& topology,
     std::unique_ptr<CompileOptions> options) {
-  return absl::UnimplementedError(
-      "IFRT IR compiler does not support AOT compilation");
+  tsl::profiler::TraceMe traceme("IfrtIrProgramCompiler::Compile");
+
+  if (!isa_and_nonnull<IfrtIRProgram>(program.get())) {
+    return absl::InvalidArgumentError(
+        "IFRT IR compiler requires an IFRT IR program");
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<IfrtIRCompileOptions> ifrt_ir_compile_options,
+      GetIfrtIRCompileOptions(std::move(options)));
+  ABSL_ASSIGN_OR_RETURN(
+      std::unique_ptr<AtomProgramCompiler> atom_program_compiler,
+      atom_program_compiler_factory_(*ifrt_ir_compile_options));
+
+  auto [promise, future] = tsl::MakePromise<ExecutableRef>();
+  // `client_` outlives all `Compile` tasks per `xla::ifrt::Compiler`'s lifetime
+  // contract (callers must await all returned compilation futures before
+  // destroying the compiler and client).
+  tsl::Env::Default()->SchedClosure(WithCurrentUserContext(
+      [client = client_, program = std::move(program),
+       ifrt_ir_compile_options = std::move(ifrt_ir_compile_options),
+       atom_program_compiler = std::move(atom_program_compiler),
+       promise = std::move(promise)]() mutable {
+        IfrtIrExecutable::Create(cast<IfrtIRProgram>(std::move(program)),
+                                 std::move(ifrt_ir_compile_options), client,
+                                 std::move(atom_program_compiler))
+            .OnReady([promise = std::move(promise)](
+                         absl::StatusOr<ExecutableRef> executable) mutable {
+              promise.Set(std::move(executable));
+            });
+      }));
+  return future;
 }
 
 absl::Status IfrtIrProgramCompiler::IsExecutableVersionCompatible(

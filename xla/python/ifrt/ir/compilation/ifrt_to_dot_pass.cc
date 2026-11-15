@@ -20,8 +20,13 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "absl/base/nullability.h"
+#include "absl/container/btree_map.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/log/check.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "llvm/ADT/STLExtras.h"
@@ -41,6 +46,7 @@ limitations under the License.
 #include "mlir/Support/WalkResult.h"
 #include "tsl/platform/numbers.h"
 #include "tsl/platform/path.h"
+#include "xla/pjrt/compiled_memory_stats.h"
 #include "xla/python/ifrt/attribute_map.h"
 #include "xla/python/ifrt/executable.h"
 #include "xla/python/ifrt/ir/compilation/atom_program_compiler.h"
@@ -52,7 +58,7 @@ limitations under the License.
 #include "xla/python/ifrt/ir/utils.h"
 #include "xla/python/ifrt/mlir/fingerprint_utils.h"
 #include "xla/python/ifrt/shape.h"
-#include "xla/service/hlo.pb.h"
+#include "xla/tsl/concurrency/future.h"
 #include "xla/tsl/platform/env.h"
 #include "xla/tsl/platform/file_system.h"
 
@@ -113,9 +119,15 @@ class IfrtToDotPass : public impl::IfrtToDotPassBase<IfrtToDotPass> {
 
   explicit IfrtToDotPass(
       IfrtToDotPassOptions options,
-      std::shared_ptr<AtomExecutableFutureMap> atom_executable_future_map)
+      std::shared_ptr<AtomExecutableFutureMap> atom_executable_future_map,
+      std::shared_ptr<CompiledAtomProgramFutureMap>
+          compiled_atom_program_future_map,
+      std::shared_ptr<AtomExecutableMap> bound_executable_map)
       : IfrtToDotPassBase(std::move(options)),
-        atom_executable_future_map_(std::move(atom_executable_future_map)) {}
+        atom_executable_future_map_(std::move(atom_executable_future_map)),
+        compiled_atom_program_future_map_(
+            std::move(compiled_atom_program_future_map)),
+        bound_executable_map_(std::move(bound_executable_map)) {}
 
   void runOnOperation() override;
 
@@ -214,21 +226,23 @@ class IfrtToDotPass : public impl::IfrtToDotPassBase<IfrtToDotPass> {
     edges_.clear();
   }
 
-  // Returns peak memory and flops stats from the executable.
+  // Returns peak memory and flops stats from `executable`.
   //
   // In case an executable does not offer such stats (e.g., MpmdReshard), the
   // function returns -1.0 for the corresponding stat.
-  ExecutableStats getStatsFromExecutable(LoadedExecutableRef executable) {
+  template <typename ExecutableT>
+  ExecutableStats getStatsFromExecutable(const ExecutableT& executable) {
     ExecutableStats stats = {/*peak_memory_in_bytes=*/-1,
                              /*flops=*/-1.0,
                              /*argument_size_in_bytes=*/-1,
                              /*output_size_in_bytes=*/-1,
                              /*alias_size_in_bytes=*/-1};
-    // Get peak memory from the compiled memory stas.
-    auto memory_stats = executable->GetCompiledMemoryStats();
+    // Get peak memory from the compiled memory stats.
+    absl::StatusOr<xla::CompiledMemoryStats> memory_stats =
+        executable.GetCompiledMemoryStats();
     if (!memory_stats.ok()) {
       LOG(WARNING) << "Failed to get compiled memory stats for executable "
-                   << executable->name() << ": " << memory_stats.status();
+                   << executable.name() << ": " << memory_stats.status();
     } else {
       stats.argument_size_in_bytes = memory_stats->argument_size_in_bytes;
       stats.output_size_in_bytes = memory_stats->output_size_in_bytes;
@@ -241,25 +255,33 @@ class IfrtToDotPass : public impl::IfrtToDotPassBase<IfrtToDotPass> {
     }
 
     // Get flops from the cost analysis.
-    if (auto cost_analysis = executable->GetCostAnalysis();
+    if (absl::StatusOr<AttributeMap> cost_analysis =
+            executable.GetCostAnalysis();
         cost_analysis.ok()) {
-      auto flops = cost_analysis->Get<float>("flops");
+      absl::StatusOr<float> flops = cost_analysis->Get<float>("flops");
       if (flops.ok()) {
         stats.flops = *flops;
       } else {
-        LOG(WARNING) << "Cost analysis of executable " << executable->name()
+        LOG(WARNING) << "Cost analysis of executable " << executable.name()
                      << " does not contain flops";
       }
     } else {
       LOG(WARNING) << "Failed to get cost analysis from executable "
-                   << executable->name() << ": " << cost_analysis.status();
+                   << executable.name() << ": " << cost_analysis.status();
     }
     return stats;
   }
 
-  // Map from atom program name to the executable. It is used to get stats
-  // about the executables.
+  // Map from atom program name to the loaded executable. It is used to get
+  // stats about the executables.
   std::shared_ptr<AtomExecutableFutureMap> atom_executable_future_map_;
+
+  // Optional map from atom program name to the compiled atom program.
+  std::shared_ptr<CompiledAtomProgramFutureMap>
+      compiled_atom_program_future_map_;
+
+  // Optional fallback map of externally bound loaded executables.
+  std::shared_ptr<AtomExecutableMap> bound_executable_map_;
 
   // Counter for generating unique node/subgraph identifiers.
   int last_node_id_ = 0;
@@ -317,23 +339,71 @@ void IfrtToDotPass::runOnOperation() {
               std::string atom_program_name = loaded_exec_op.getSymName().str();
 
               // Get memory and flops stats from the executable.
-              auto exec_it =
-                  atom_executable_future_map_->find(atom_program_name);
-              if (exec_it == atom_executable_future_map_->end()) {
+              ExecutableStats stats;
+              AtomExecutableFutureMap::iterator executable_it;
+              AtomExecutableMap::const_iterator bound_it;
+              if (atom_executable_future_map_ != nullptr &&
+                  (executable_it =
+                       atom_executable_future_map_->find(atom_program_name)) !=
+                      atom_executable_future_map_->end()) {
+                absl::StatusOr<LoadedExecutableRef> executable =
+                    executable_it->second.Await();
+                if (!executable.ok()) {
+                  op.emitOpError(absl::StrCat(
+                      "Failed to compile atom program '", atom_program_name,
+                      "': ", executable.status()));
+                  return mlir::failure();
+                }
+                if (*executable == nullptr) {
+                  op.emitOpError(absl::StrCat("Compiled atom program '",
+                                              atom_program_name,
+                                              "' returned a null executable"));
+                  return mlir::failure();
+                }
+                stats = getStatsFromExecutable(**executable);
+              } else if (bound_executable_map_ != nullptr &&
+                         (bound_it =
+                              bound_executable_map_->find(atom_program_name)) !=
+                             bound_executable_map_->end()) {
+                if (bound_it->second == nullptr) {
+                  op.emitOpError(absl::StrCat("Bound atom program '",
+                                              atom_program_name,
+                                              "' has a null executable"));
+                  return mlir::failure();
+                }
+                stats = getStatsFromExecutable(*bound_it->second);
+              } else if (compiled_atom_program_future_map_ != nullptr) {
+                auto compiled_it =
+                    compiled_atom_program_future_map_->find(atom_program_name);
+                if (compiled_it == compiled_atom_program_future_map_->end()) {
+                  op.emitOpError(
+                      absl::StrCat("No executable found for atom program ",
+                                   atom_program_name));
+                  return mlir::failure();
+                }
+                absl::StatusOr<
+                    absl_nonnull std::shared_ptr<const CompiledAtomProgram>>
+                    compiled_atom = compiled_it->second.Await();
+                if (!compiled_atom.ok()) {
+                  op.emitOpError(absl::StrCat(
+                      "Failed to compile atom program '", atom_program_name,
+                      "': ", compiled_atom.status()));
+                  return mlir::failure();
+                }
+                if (*compiled_atom == nullptr ||
+                    (*compiled_atom)->executable == nullptr) {
+                  op.emitOpError(absl::StrCat("Compiled atom program '",
+                                              atom_program_name,
+                                              "' returned a null executable"));
+                  return mlir::failure();
+                }
+                stats = getStatsFromExecutable(*(*compiled_atom)->executable);
+              } else {
                 op.emitOpError(
                     absl::StrCat("No executable found for atom program ",
                                  atom_program_name));
                 return mlir::failure();
               }
-              absl::StatusOr<LoadedExecutableRef> exec =
-                  exec_it->second.Await();
-              if (!exec.ok()) {
-                op.emitOpError(absl::StrCat("Failed to compile atom program '",
-                                            atom_program_name,
-                                            "': ", exec.status()));
-                return mlir::failure();
-              }
-              auto stats = getStatsFromExecutable(*std::move(exec));
               auto devices = loaded_exec_op.getDevices();
 
               // Add a DOT node for the executable only if its flops and peak
@@ -353,8 +423,7 @@ void IfrtToDotPass::runOnOperation() {
                   os, exec_label, kShapeNode,
                   devices_attr_to_color_[loaded_exec_op.getDevicesAttr()]);
 
-              absl::flat_hash_map<int, int64_t>
-                  per_device_array_size_between_execs;
+              absl::btree_map<int, int64_t> per_device_array_size_between_execs;
               // Calculate per-device size of the arrays that are passed between
               // executables.
               for (const auto& input : op.getInputs()) {
@@ -460,9 +529,16 @@ void IfrtToDotPass::runOnOperation() {
 
 std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createIfrtToDotPass(
     IfrtToDotPassOptions options,
-    std::shared_ptr<AtomExecutableFutureMap> atom_executable_future_map) {
-  return std::make_unique<IfrtToDotPass>(std::move(options),
-                                         std::move(atom_executable_future_map));
+    std::shared_ptr<AtomExecutableFutureMap> atom_executable_future_map,
+    std::shared_ptr<CompiledAtomProgramFutureMap>
+        compiled_atom_program_future_map,
+    std::shared_ptr<AtomExecutableMap> bound_executable_map) {
+  CHECK(atom_executable_future_map != nullptr ||
+        compiled_atom_program_future_map != nullptr);
+  return std::make_unique<IfrtToDotPass>(
+      std::move(options), std::move(atom_executable_future_map),
+      std::move(compiled_atom_program_future_map),
+      std::move(bound_executable_map));
 }
 
 void registerIfrtToDotPass(
@@ -472,7 +548,9 @@ void registerIfrtToDotPass(
       [atom_executable_future_map = std::move(atom_executable_future_map),
        options = std::move(options)]() -> std::unique_ptr<mlir::Pass> {
         return createIfrtToDotPass(std::move(options),
-                                   std::move(atom_executable_future_map));
+                                   std::move(atom_executable_future_map),
+                                   /*compiled_atom_program_future_map=*/nullptr,
+                                   /*bound_executable_map=*/nullptr);
       });
 }
 
