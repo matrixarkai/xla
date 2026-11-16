@@ -470,15 +470,26 @@ absl::Status HeapSimulator::RunComputation(
               continue;
             }
 
-            // Only share with values that the user consumes through their
-            // defining instruction. The user may also read the value through
-            // other positions (e.g. a bitcast of it) or through several
-            // operands. All of them are backed by the same buffer, so every use
-            // of the value by the user has to allow sharing.
-            if (value->instruction()->IsUserOf(operand_value->instruction()) &&
+            // The user may read the operand value through its defining
+            // instruction, through other positions (e.g. a get-tuple-element
+            // or a bitcast of it), or through several operands. All of them
+            // are backed by the same buffer, so every use of the value by the
+            // user has to allow sharing. Stats-only runs (such as
+            // MinimumMemoryForModule in DefaultMemoryScheduler) only pre-free
+            // direct operands so that schedule scoring is not skewed by
+            // view-mediated sharing.
+            const bool is_direct_operand =
+                value->instruction()->IsUserOf(operand_value->instruction());
+            const bool may_reuse_through_other_positions =
+                options_.may_reuse_operand_buffers_through_other_positions &&
+                !algorithm_->IsStatsOnly();
+            if ((is_direct_operand || may_reuse_through_other_positions) &&
                 dataflow_analysis.CanShareOperandValueBufferWithUser(
                     *operand_value, value->instruction(), value->index(),
                     alias_info)) {
+              if (!is_direct_operand) {
+                ++num_buffers_reused_through_other_positions_;
+              }
               // Remove the operand buffer right before sharing (allocating) a
               // new one.
               Free(operand_value, operand_value->instruction());
@@ -615,6 +626,8 @@ absl::StatusOr<HeapSimulator::Result<HloValue>> HeapSimulator::Finish() {
   ABSL_ASSIGN_OR_RETURN(const Result<HloValue> no_frag_result,
                         no_fragmentation_stats_->Finish());
   result.fragmentation_size = result.heap_size - no_frag_result.heap_size;
+  result.num_buffers_reused_through_other_positions =
+      num_buffers_reused_through_other_positions_;
 
   // Copy the debug trace we collected to the final result.
   result.debug_trace.Swap(&debug_trace_);

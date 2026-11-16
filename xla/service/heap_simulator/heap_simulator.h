@@ -126,6 +126,11 @@ class HeapSimulator {
     // The total size in bytes of heap fragmentation.
     int64_t fragmentation_size = 0;
 
+    // The number of buffers that reuse the buffer of an operand value that
+    // their instruction only reads through other positions, see
+    // Options::may_reuse_operand_buffers_through_other_positions.
+    int64_t num_buffers_reused_through_other_positions = 0;
+
     // A trace of heap simulation events.
     HeapSimulatorTrace debug_trace;
   };
@@ -134,12 +139,22 @@ class HeapSimulator {
   struct Options {
     Options()
         : may_reuse_operand_buffers(true),
+          may_reuse_operand_buffers_through_other_positions(true),
           alloc_constants(false),
           buffers_to_assign(nullptr) {}
 
     // Whether a buffer about to be Free()-ed, can be recycled for a new born
     // one, hence collapsing Free()+Alloc() calls (default true).
     bool may_reuse_operand_buffers;
+    // Whether a new born buffer may also recycle the buffer of an operand value
+    // that its instruction only reads through other positions of the value
+    // (e.g. a get-tuple-element or a bitcast of the defining instruction). If
+    // false, only the buffers of values defined by direct operands are
+    // recycled. Recycling through other positions lowers the peak memory, but
+    // the recycled buffers stay at the same offset for longer, which can make
+    // them harder to pack (default true). Only relevant if
+    // `may_reuse_operand_buffers` is true.
+    bool may_reuse_operand_buffers_through_other_positions;
     // Whether to issue Alloc() and Free() calls for constants (default false).
     bool alloc_constants;
     // If 'buffers_to_assign' is provided, only those buffers are assigned
@@ -260,6 +275,10 @@ class HeapSimulator {
   // handling of subcomputations, but it's not clear how.
   const HloSchedule* schedule_;
 
+  // The number of buffers that reuse the buffer of an operand value which their
+  // instruction only reads through other positions.
+  int64_t num_buffers_reused_through_other_positions_ = 0;
+
   // Hold some sets for error-checking the sequence of Alloc and Free calls.
   absl::flat_hash_set<const HloValue*> allocated_buffers_;
   absl::flat_hash_set<const HloValue*> freed_buffers_;
@@ -319,6 +338,10 @@ class HeapAlgorithm {
   // Finish collects the buffer offset assignment results.  Finish may only be
   // called once, after all Alloc and Free calls.
   virtual absl::StatusOr<Result> Finish() = 0;
+
+  // Returns true if this algorithm only collects heap size statistics without
+  // computing chunk assignments (e.g. NoFragmentationStatsHeap).
+  virtual bool IsStatsOnly() const { return false; }
 };
 
 // NoFragmentationStatsHeap computes the heap size assuming no fragmentation;
@@ -342,6 +365,8 @@ class NoFragmentationStatsHeap : public HeapAlgorithm<BufferType> {
   void Free(const BufferType* buffer, int64_t size) override;
 
   absl::StatusOr<Result> Finish() override;
+
+  bool IsStatsOnly() const override { return true; }
 
  private:
   int64_t current_heap_size_ = 0;

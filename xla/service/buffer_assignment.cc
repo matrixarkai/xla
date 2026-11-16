@@ -3308,6 +3308,28 @@ absl::Status BufferAssigner::AssignBuffersWithSequentialOrdering(
     return build_algorithm(algo_to_use);
   };
 
+  // Runs the heap simulation `run` with `options`. Reusing operand buffers
+  // through other positions lowers the peak memory, but the reused buffers stay
+  // at the same offset for longer, which can increase the fragmentation by more
+  // than that. So if the simulation reused such buffers, it is run again
+  // without this kind of reuse, and the reuse is only kept if it results in a
+  // smaller heap.
+  auto run_heap_simulation =
+      [](HeapSimulator::Options options,
+         auto&& run) -> absl::StatusOr<HeapSimulator::Result<HloValue>> {
+    ABSL_ASSIGN_OR_RETURN(HeapSimulator::Result<HloValue> result, run(options));
+    if (result.num_buffers_reused_through_other_positions == 0) {
+      return result;
+    }
+    options.may_reuse_operand_buffers_through_other_positions = false;
+    ABSL_ASSIGN_OR_RETURN(HeapSimulator::Result<HloValue> direct_only_result,
+                          run(options));
+    if (result.heap_size < direct_only_result.heap_size) {
+      return result;
+    }
+    return direct_only_result;
+  };
+
   if (run_whole_module_heap_simulation) {
     // Run the heap simulation over the whole module. This reduces memory
     // usage, since buffers for kCall, kWhile, and kConditional
@@ -3354,10 +3376,14 @@ absl::Status BufferAssigner::AssignBuffersWithSequentialOrdering(
       options.buffers_to_assign = &color_map[color];
       HeapSimulator::Result<HloValue> result;
       ABSL_ASSIGN_OR_RETURN(
-          result, HeapSimulator::Run(get_heap_algorithm(alignment, color),
-                                     assignment->module(), schedule,
-                                     assignment->alias_analysis(), alias_info_,
-                                     &assignment->buffer_size_, options));
+          result, run_heap_simulation(
+                      options, [&](const HeapSimulator::Options& options) {
+                        return HeapSimulator::Run(
+                            get_heap_algorithm(alignment, color),
+                            assignment->module(), schedule,
+                            assignment->alias_analysis(), alias_info_,
+                            &assignment->buffer_size_, options);
+                      }));
       ABSL_RETURN_IF_ERROR(AssignBuffersFromHeapSimulator(
           result, assignment, color, isolation_options));
     }
@@ -3383,10 +3409,14 @@ absl::Status BufferAssigner::AssignBuffersWithSequentialOrdering(
         options.view_color = opts_.dus_view_color;
         HeapSimulator::Result<HloValue> result;
         ABSL_ASSIGN_OR_RETURN(
-            result, HeapSimulator::Run(
-                        get_heap_algorithm(alignment, color), *computation,
-                        *instruction_sequence, assignment->alias_analysis(),
-                        alias_info_, &assignment->buffer_size_, options));
+            result, run_heap_simulation(
+                        options, [&](const HeapSimulator::Options& options) {
+                          return HeapSimulator::Run(
+                              get_heap_algorithm(alignment, color),
+                              *computation, *instruction_sequence,
+                              assignment->alias_analysis(), alias_info_,
+                              &assignment->buffer_size_, options);
+                        }));
         ABSL_RETURN_IF_ERROR(AssignBuffersFromHeapSimulator(
             result, assignment, color, isolation_options));
       }

@@ -245,6 +245,45 @@ TEST_F(MinimumMemoryForSequenceTest, SubcomputationAccounting) {
                     .value());
 }
 
+TEST_F(MinimumMemoryForSequenceTest,
+       DoesNotPreFreeOperandReadOnlyThroughViewPosition) {
+  const char* const hlo_text = R"(
+HloModule DoesNotPreFreeOperandReadOnlyThroughViewPosition
+
+ENTRY main {
+  param = f32[4] parameter(0)
+  mul = f32[4] negate(param)
+  bc = f32[4] bitcast(mul)
+  ROOT out = f32[4] exponential(bc)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_text));
+  HloComputation* entry = module->entry_computation();
+  HloInstruction* param = FindInstruction(module.get(), "param");
+  HloInstruction* mul = FindInstruction(module.get(), "mul");
+  HloInstruction* bc = FindInstruction(module.get(), "bc");
+  HloInstruction* out = FindInstruction(module.get(), "out");
+
+  HloSchedule schedule(module.get());
+  schedule.set_sequence(entry, {param, mul, bc, out});
+  ASSERT_OK(schedule.Verify());
+
+  BufferValue::SizeFunction size_fn = [](const BufferValue& buffer) {
+    return ShapeUtil::ByteSizeOf(buffer.shape());
+  };
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloAliasAnalysis> alias_analysis,
+                       HloAliasAnalysis::Run(module.get(), &alias_info_));
+
+  // Stats-only runs (MinimumMemoryForModule) only pre-free direct operands, so
+  // param (16B), mul (16B), and out (16B) are counted at out's definition step
+  // before mul is freed at the end of the step (48B total).
+  ASSERT_OK_AND_ASSIGN(int64_t min_memory,
+                       HeapSimulator::MinimumMemoryForModule(
+                           schedule, *alias_analysis, &alias_info_, &size_fn));
+  EXPECT_EQ(48, min_memory);
+}
+
 const char kAlloc[] = "Alloc";
 const char kFree[] = "Free";
 const char kShare[] = "Share";
@@ -302,12 +341,13 @@ class HeapSimulatorTracker {
       std::unique_ptr<HloModule> module,
       const std::vector<HloInstruction*>& instruction_sequence,
       const std::vector<HloInstruction*>& must_alias_set = {},
-      const AliasInfo* alias_info = nullptr) {
+      const AliasInfo* alias_info = nullptr,
+      const HeapSimulator::Options& options = HeapSimulator::Options()) {
     module_ = std::move(module);
     if (alias_info == nullptr) {
       alias_info = &alias_info_;
     }
-    Init(instruction_sequence, alias_info);
+    Init(instruction_sequence, alias_info, options);
   }
 
   // Constructor for testing a single entry computation.
@@ -323,7 +363,7 @@ class HeapSimulatorTracker {
     if (alias_info == nullptr) {
       alias_info = &alias_info_;
     }
-    Init(instruction_sequence, alias_info);
+    Init(instruction_sequence, alias_info, HeapSimulator::Options());
   }
 
   explicit HeapSimulatorTracker(const std::string& name) {
@@ -377,6 +417,12 @@ class HeapSimulatorTracker {
     return result_.heap_results.at(0).chunk_map.at(buffer).offset;
   }
 
+  // Returns the number of buffers that reuse the buffer of an operand value
+  // which their instruction only reads through other positions.
+  int64_t num_buffers_reused_through_other_positions() const {
+    return result_.num_buffers_reused_through_other_positions;
+  }
+
   // Ensures the expected sequence of Alloc/Free/Finish calls was performed.
   void ExpectCallSequence(const CallSequence& expected) const {
     auto to_string = [](const CallSequence& sequence) {
@@ -412,7 +458,8 @@ class HeapSimulatorTracker {
 
  private:
   void Init(const std::vector<HloInstruction*>& instruction_sequence,
-            const AliasInfo* alias_info) {
+            const AliasInfo* alias_info,
+            const HeapSimulator::Options& options) {
     // Since we're only tracking the sequence of Alloc/Free calls, the actual
     // size of the buffers doesn't matter, so we always return 0.  We rely on
     // the secondary sorting criteria of DecreasingSizeRunsHeap to sort calls
@@ -423,8 +470,6 @@ class HeapSimulatorTracker {
     auto algorithm = std::make_unique<HeapCallRecorder>(&actual_calls_);
 
     alias_analysis_ = HloAliasAnalysis::Run(module_.get(), alias_info).value();
-
-    HeapSimulator::Options options;
 
     result_ =
         HeapSimulator::Run(std::move(algorithm), *module_->entry_computation(),
@@ -473,6 +518,98 @@ TEST_F(HeapSimulatorTest, OneParam) {
       {kFree, tracker.BufferAt(param0, {})},
       {kFinish, nullptr},
   });
+}
+
+TEST_F(HeapSimulatorTest, CanShareOperandThroughSingleBitcastPosition) {
+  const char* const hlo_text = R"(
+HloModule CanShareOperandThroughSingleBitcastPosition
+
+ENTRY main {
+  param = f32[4] parameter(0)
+  mul = f32[4] negate(param)
+  bc = f32[4] bitcast(mul)
+  ROOT out = f32[4] exponential(bc)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_text));
+  HloInstruction* param = FindInstruction(module.get(), "param");
+  HloInstruction* mul = FindInstruction(module.get(), "mul");
+  HloInstruction* bc = FindInstruction(module.get(), "bc");
+  HloInstruction* out = FindInstruction(module.get(), "out");
+
+  HeapSimulatorTracker tracker(std::move(module), {param, mul, bc, out});
+  tracker.ExpectCallSequence({
+      {kAlloc, tracker.BufferAt(param, {})},
+      {kAlloc, tracker.BufferAt(mul, {})},
+      {kFree, tracker.BufferAt(mul, {})},
+      {kShare, tracker.BufferAt(out, {})},
+      {kFree, tracker.BufferAt(param, {})},
+      {kFree, tracker.BufferAt(out, {})},
+      {kFinish, nullptr},
+  });
+  tracker.ExpectSharedBuffers(out, {}, mul, {});
+  EXPECT_EQ(tracker.num_buffers_reused_through_other_positions(), 1);
+}
+
+TEST_F(HeapSimulatorTest, DoesNotShareOperandThroughBitcastPositionIfDisabled) {
+  const char* const hlo_text = R"(
+HloModule DoesNotShareOperandThroughBitcastPositionIfDisabled
+
+ENTRY main {
+  param = f32[4] parameter(0)
+  mul = f32[4] negate(param)
+  bc = f32[4] bitcast(mul)
+  exp = f32[4] exponential(bc)
+  ROOT out = f32[4] negate(exp)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_text));
+  HloInstruction* param = FindInstruction(module.get(), "param");
+  HloInstruction* mul = FindInstruction(module.get(), "mul");
+  HloInstruction* bc = FindInstruction(module.get(), "bc");
+  HloInstruction* exp = FindInstruction(module.get(), "exp");
+  HloInstruction* out = FindInstruction(module.get(), "out");
+
+  HeapSimulator::Options options;
+  options.may_reuse_operand_buffers_through_other_positions = false;
+  HeapSimulatorTracker tracker(std::move(module), {param, mul, bc, exp, out},
+                               /*must_alias_set=*/{}, /*alias_info=*/nullptr,
+                               options);
+
+  // `exp` only reads `mul` through `bc`, so it gets its own buffer.
+  EXPECT_NE(tracker.OffsetAt(exp, {}), tracker.OffsetAt(mul, {}));
+  // `out` reads `exp` directly, so it still shares its buffer.
+  tracker.ExpectSharedBuffers(out, {}, exp, {});
+  EXPECT_EQ(tracker.num_buffers_reused_through_other_positions(), 0);
+}
+
+TEST_F(HeapSimulatorTest, CanShareOperandReadElementwiseTwiceThroughTuple) {
+  const char* const hlo_text = R"(
+HloModule CanShareOperandReadElementwiseTwiceThroughTuple
+
+ENTRY main {
+  param = f32[4] parameter(0)
+  mul = f32[4] negate(param)
+  tup = (f32[4], f32[4]) tuple(mul, mul)
+  gte0 = f32[4] get-tuple-element(tup), index=0
+  gte1 = f32[4] get-tuple-element(tup), index=1
+  ROOT out = f32[4] add(gte0, gte1)
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_text));
+  HloInstruction* param = FindInstruction(module.get(), "param");
+  HloInstruction* mul = FindInstruction(module.get(), "mul");
+  HloInstruction* tup = FindInstruction(module.get(), "tup");
+  HloInstruction* gte0 = FindInstruction(module.get(), "gte0");
+  HloInstruction* gte1 = FindInstruction(module.get(), "gte1");
+  HloInstruction* out = FindInstruction(module.get(), "out");
+
+  HeapSimulatorTracker tracker(std::move(module),
+                               {param, mul, tup, gte0, gte1, out});
+  tracker.ExpectSharedBuffers(out, {}, mul, {});
 }
 
 TEST_F(HeapSimulatorTest, Multiply) {
