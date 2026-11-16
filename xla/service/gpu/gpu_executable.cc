@@ -28,7 +28,9 @@ limitations under the License.
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/base/no_destructor.h"
 #include "absl/base/nullability.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
@@ -695,10 +697,101 @@ absl::Status RendezvousAfterExecution(
     const ServiceExecutableRunOptions& run_options,
     const DebugOptions& debug_options);
 
+namespace {
+
+absl::Mutex& GetProgressLogMutex() {
+  static absl::NoDestructor<absl::Mutex> log_mutex;
+  return *log_mutex;
+}
+
+// Releases `tracker`, waiting for any in-flight `LogExecutionProgress` call
+// that temporarily locked a `weak_ptr` under `GetProgressLogMutex()` so that
+// `ProgressTracker` (and its borrowed `EventPool::Event`s) are always destroyed
+// before `BlockHostUntilDone` / `StreamExecutor` teardown can proceed.
+void ReleaseProgressTracker(
+    std::shared_ptr<ThunkExecutor::ProgressTracker> tracker) {
+  if (tracker == nullptr) {
+    return;
+  }
+  absl::MutexLock lock(GetProgressLogMutex());
+  tracker.reset();
+}
+
+// Logs a progress-tracker dump for `weak_tracker` when a host or device
+// execution watchdog fires. Serialized across threads by `GetProgressLogMutex`
+// so concurrent dumps from multiple GPU ranks do not interleave.
+void LogExecutionProgress(
+    absl::string_view watchdog_name, int32_t device_ordinal,
+    int32_t progress_tracking_n,
+    const std::weak_ptr<ThunkExecutor::ProgressTracker>& weak_tracker) {
+  absl::MutexLock lock(GetProgressLogMutex());
+  std::shared_ptr<ThunkExecutor::ProgressTracker> tracker = weak_tracker.lock();
+  if (tracker == nullptr) {
+    return;
+  }
+
+  size_t num_thunks = tracker->num_thunks();
+  size_t num_executions = tracker->num_executions();
+
+  LOG(ERROR) << absl::StreamFormat(
+      "[%d] Progress tracking for %s:", device_ordinal, watchdog_name);
+  LOG(ERROR) << absl::StreamFormat(
+      "[%d] Completed thunks: %d/%d (unique thunks: %d)", device_ordinal,
+      tracker->NumCompletedThunks(), num_executions, num_thunks);
+  LOG(ERROR) << absl::StreamFormat(
+      "[%d] Pending thunks: %d/%d (unique thunks: %d)", device_ordinal,
+      tracker->NumPendingThunks(), num_executions, num_thunks);
+
+  auto log_thunks =
+      [&](absl::string_view label,
+          std::vector<ThunkExecutor::ProgressTracker::ThunkExecution> thunks,
+          bool log_nested_thunks) {
+        LOG(ERROR) << absl::StreamFormat("[%d] %s: size=%d", device_ordinal,
+                                         label, thunks.size());
+        absl::c_sort(thunks, [](const auto& a, const auto& b) {
+          return a.exec_idx < b.exec_idx;
+        });
+        for (const auto& thunk : thunks) {
+          std::string loop_info;
+          for (const auto& state : thunk.loop_nest) {
+            absl::StrAppend(&loop_info,
+                            absl::StrFormat(" [%s iter=%d]", state.loop_name,
+                                            state.loop_iteration));
+          }
+          LOG(ERROR) << absl::StreamFormat(
+              "[%d]   - exec[%d] thunk[%d/%d] %v: %s at %s%s", device_ordinal,
+              thunk.exec_idx, thunk.thunk_idx, num_thunks, thunk.kind,
+              thunk.name,
+              absl::FormatTime("%Y-%m-%d %H:%M:%S.%E6f", thunk.executed,
+                               absl::LocalTimeZone()),
+              loop_info);
+          if (log_nested_thunks) {
+            for (const auto& nested : thunk.nested_thunks) {
+              LOG(ERROR) << absl::StreamFormat(
+                  "[%d]       nested thunk[%d/%d] %v: %s", device_ordinal,
+                  nested.thunk_idx, num_thunks, nested.kind, nested.name);
+            }
+          }
+        }
+      };
+
+  log_thunks("Last completed thunks",
+             tracker->LastCompletedThunks(progress_tracking_n),
+             /*log_nested_thunks=*/false);
+  log_thunks("First pending thunks",
+             tracker->FirstPendingThunks(progress_tracking_n),
+             /*log_nested_thunks=*/true);
+  log_thunks("Last pending thunks",
+             tracker->LastPendingThunks(progress_tracking_n),
+             /*log_nested_thunks=*/true);
+}
+
 // Returns HangWatchdog guards for the given execution timeout handlers.
-static std::vector<std::shared_ptr<HangWatchdog::Guard>> ExecutionTimeoutGuards(
+std::vector<std::shared_ptr<HangWatchdog::Guard>> ExecutionTimeoutGuards(
     absl::Span<ExecutionTimeoutHandler> handlers,
-    absl::string_view watchdog_name) {
+    absl::string_view watchdog_name, int32_t device_ordinal,
+    int32_t progress_tracking_n,
+    std::weak_ptr<ThunkExecutor::ProgressTracker> weak_tracker) {
   std::vector<std::shared_ptr<HangWatchdog::Guard>> guards;
   for (ExecutionTimeoutHandler& handler : handlers) {
     if (!handler.callback || handler.timeout == absl::InfiniteDuration()) {
@@ -708,15 +801,20 @@ static std::vector<std::shared_ptr<HangWatchdog::Guard>> ExecutionTimeoutGuards(
     guards.push_back(HangWatchdog::Global().Watch(
         watchdog_name, handler.timeout,
         [watchdog_name = std::string(watchdog_name), timeout = handler.timeout,
+         device_ordinal, progress_tracking_n, weak_tracker,
          callback = std::move(handler.callback)]() mutable {
           LOG(ERROR) << absl::StreamFormat(
               "%s failed to finish in %v, call execution timeout handler.",
               watchdog_name, timeout);
+          LogExecutionProgress(watchdog_name, device_ordinal,
+                               progress_tracking_n, weak_tracker);
           std::move(callback)(watchdog_name, timeout);
         }));
   }
   return guards;
 }
+
+}  // namespace
 
 absl::Status GpuExecutable::ExecuteThunksImpl(
     const DebugOptions& debug_options, const std::string& module_name,
@@ -765,6 +863,38 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
     ABSL_ASSIGN_OR_RETURN(tracker,
                           InstallProgressTracker(executor, thunk_executor));
   }
+  std::shared_ptr<ThunkExecutor::ProgressTracker> progress_tracker =
+      tracker.has_value() ? tracker->tracker() : nullptr;
+
+  absl::Cleanup cleanup_progress_tracker = [&] {
+    tracker.reset();
+    if (progress_tracker != nullptr) {
+      if (progress_tracker->num_executions() > 0) {
+        if (!main_stream
+                 ->DoHostCallback([tracker = progress_tracker]() mutable {
+                   ReleaseProgressTracker(std::move(tracker));
+                 })
+                 .ok()) {
+          (void)main_stream->BlockHostUntilDone();
+        }
+      }
+      ReleaseProgressTracker(std::move(progress_tracker));
+    }
+  };
+
+  auto make_progress_logger =
+      [&](absl::string_view watchdog_name) -> HangWatchdog::CancelCallback {
+    if (progress_tracker == nullptr) {
+      return nullptr;
+    }
+    return [watchdog_name = std::string(watchdog_name),
+            device_ordinal = executor->device_ordinal(), progress_tracking_n,
+            weak_tracker = std::weak_ptr<ThunkExecutor::ProgressTracker>(
+                progress_tracker)]() {
+      LogExecutionProgress(watchdog_name, device_ordinal, progress_tracking_n,
+                           weak_tracker);
+    };
+  };
 
   absl::Duration host_timeout = absl::InfiniteDuration();
   absl::Duration device_timeout = absl::InfiniteDuration();
@@ -800,57 +930,15 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
 
   // Monitors that host thread makes progress and does not get stuck.
   std::vector<std::shared_ptr<HangWatchdog::Guard>> host_guards =
-      ExecutionTimeoutGuards(host_handlers, host_watchdog_name);
+      ExecutionTimeoutGuards(host_handlers, host_watchdog_name,
+                             executor->device_ordinal(), progress_tracking_n,
+                             progress_tracker);
 
   if (host_timeout < absl::InfiniteDuration()) {
-    HangWatchdog::CancelCallback pre_abort;
-    if (tracker.has_value()) {
-      pre_abort = [tracker = tracker->tracker(), progress_tracking_n,
-                   device_ordinal = executor->device_ordinal()] {
-        auto log_progress = [&](auto label, auto thunks) {
-          LOG(ERROR) << absl::StreamFormat("[%d] %s: size=%d", device_ordinal,
-                                           label, thunks.size());
-          absl::c_sort(thunks, [](const auto& a, const auto& b) {
-            return a.executed < b.executed;
-          });
-          for (auto& thunk : thunks) {
-            std::string loop_info;
-            for (const auto& state : thunk.loop_nest) {
-              absl::StrAppend(&loop_info,
-                              absl::StrFormat(" [%s iter=%d]", state.loop_name,
-                                              state.loop_iteration));
-            }
-            LOG(ERROR) << absl::StreamFormat(
-                "  - exec[%d] thunk[%d/%d] %v: %s at %s%s", thunk.exec_idx,
-                thunk.thunk_idx, tracker->num_thunks(), thunk.kind, thunk.name,
-                absl::FormatTime("%Y-%m-%d %H:%M:%S.%E6f", thunk.executed,
-                                 absl::LocalTimeZone()),
-                loop_info);
-          }
-        };
-
-        size_t num_executions = tracker->num_executions();
-        LOG(ERROR) << absl::StreamFormat(
-            "[%d] Completed thunks: %d/%d (unique thunks: %d)", device_ordinal,
-            tracker->NumCompletedThunks(), num_executions,
-            tracker->num_thunks());
-        LOG(ERROR) << absl::StreamFormat(
-            "[%d] Pending thunks: %d/%d (unique thunks: %d)", device_ordinal,
-            tracker->NumPendingThunks(), num_executions, tracker->num_thunks());
-
-        log_progress("Last completed thunks",
-                     tracker->LastCompletedThunks(progress_tracking_n));
-        log_progress("First pending thunks",
-                     tracker->FirstPendingThunks(progress_tracking_n));
-        log_progress("Last pending thunks",
-                     tracker->LastPendingThunks(progress_tracking_n));
-      };
-    }
-
     host_guards.push_back(HangWatchdog::Global().Watch(
         host_watchdog_name, host_timeout,
         HangWatchdog::Abort(host_watchdog_name, host_timeout,
-                            std::move(pre_abort))));
+                            make_progress_logger(host_watchdog_name))));
   }
 
   // Borrow stream for tracing command buffers.
@@ -1050,6 +1138,7 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
   XLA_VLOG_DEVICE(1, run_options->device_ordinal())
       << "Start GpuExecutable::ExecuteOnStream module: " << module_name;
   ABSL_RETURN_IF_ERROR(thunk_executor.ExecuteOnStream(execute_params));
+  tracker.reset();
   XLA_VLOG_DEVICE(1, run_options->device_ordinal())
       << "End GpuExecutable::ExecuteOnStream module: " << module_name;
 
@@ -1064,27 +1153,40 @@ absl::Status GpuExecutable::ExecuteThunksImpl(
   }
 
   // Device monitoring is independent of host monitoring. The stream owns these
-  // guards until the empty callback runs after the enqueued device work.
+  // guards (and the progress tracker, so its pooled events are not recycled
+  // while device work is still in flight) until the empty callback runs after
+  // the enqueued device work.
   std::string device_watchdog_name =
       absl::StrFormat("[%d] XLA GPU device execution `%s` (run_id=%v)",
                       executor->device_ordinal(), module_name, run_id);
 
   std::vector<std::shared_ptr<HangWatchdog::Guard>> device_guards =
-      ExecutionTimeoutGuards(device_handlers, device_watchdog_name);
+      ExecutionTimeoutGuards(device_handlers, device_watchdog_name,
+                             executor->device_ordinal(), progress_tracking_n,
+                             progress_tracker);
 
   if (device_timeout < absl::InfiniteDuration()) {
     device_guards.push_back(HangWatchdog::Global().Watch(
         device_watchdog_name, device_timeout,
-        HangWatchdog::Abort(device_watchdog_name, device_timeout)));
+        HangWatchdog::Abort(device_watchdog_name, device_timeout,
+                            make_progress_logger(device_watchdog_name))));
   }
 
-  if (!device_guards.empty()) {
+  if (!device_guards.empty() ||
+      (progress_tracker != nullptr && !block_host_until_done)) {
     ABSL_RETURN_IF_ERROR(
-        main_stream->DoHostCallback([guards = std::move(device_guards)] {}));
+        main_stream->DoHostCallback([guards = std::move(device_guards),
+                                     tracker = progress_tracker]() mutable {
+          ReleaseProgressTracker(std::move(tracker));
+        }));
+    ReleaseProgressTracker(std::move(progress_tracker));
   }
 
-  return MaybeSyncAndProfile(run_options, execution_timer.get(),
-                             block_host_until_done ? main_stream : nullptr);
+  ABSL_RETURN_IF_ERROR(
+      MaybeSyncAndProfile(run_options, execution_timer.get(),
+                          block_host_until_done ? main_stream : nullptr));
+  ReleaseProgressTracker(std::move(progress_tracker));
+  return absl::OkStatus();
 }
 
 namespace {

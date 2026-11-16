@@ -3955,6 +3955,7 @@ xla_test(
         "//xla:xla_data_proto_cc",
         "//xla/service:buffer_assignment",
         "//xla/service:platform_util",
+        "//xla/service:service_executable_run_options",
         "//xla/service:shaped_slice",
         "//xla/service/gpu:buffer_allocations",
         "//xla/stream_executor:device_address",
