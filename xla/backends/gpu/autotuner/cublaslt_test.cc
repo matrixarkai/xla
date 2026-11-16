@@ -26,6 +26,7 @@ limitations under the License.
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
 #include "absl/time/time.h"
 #include "mlir/IR/MLIRContext.h"
 #include "xla/autotuning.pb.h"
@@ -41,6 +42,7 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/stream_executor/blas.h"
 #include "xla/stream_executor/cuda/cublas_lt_matmul_algorithm.pb.h"
+#include "xla/stream_executor/cuda/cuda_compute_capability.h"
 #include "xla/stream_executor/device_description.pb.h"
 #include "xla/stream_executor/gpu/blas_lt_matmul_algorithm.pb.h"
 #include "xla/stream_executor/platform.h"
@@ -52,8 +54,10 @@ namespace xla {
 namespace gpu {
 namespace {
 
+using ::testing::AllOf;
 using ::testing::Gt;
 using ::testing::IsEmpty;
+using ::testing::Lt;
 using ::testing::Not;
 using ::testing::Optional;
 
@@ -378,6 +382,118 @@ TEST_F(CublasLtBackendTest, GetSupportedConfigsWithEstimates) {
   for (const auto& config : estimated_configs) {
     EXPECT_THAT(config.estimated_runtime, Optional(Gt(absl::ZeroDuration())));
   }
+}
+
+TEST_F(CublasLtBackendTest,
+       GetSupportedConfigsWithEstimatesSupportsNonDefaultEpilogue) {
+  // Use a tiny 4x4 GEMM so the base Triton estimate stays well below 5 us
+  // (including on MIG-partitioned GPUs), distinguishing the 0 us Blackwell
+  // offset from the 5 us pre-Blackwell offset.
+  constexpr absl::string_view kBiasReluHlo = R"hlo(
+HloModule module
+
+ENTRY main {
+  p0 = f32[4,4] parameter(0)
+  p1 = f32[4,4] parameter(1)
+  bias = f32[4] parameter(2)
+  %custom-call.1 = (f32[4,4]{1,0}, s8[4194304]{0}) custom-call(p0, p1, bias),
+    custom_call_target="__cublas$lt$matmul",
+    backend_config={
+      "gemm_backend_config":{
+        "alpha_real":1,
+        "dot_dimension_numbers":{
+          "lhs_contracting_dimensions":["1"],
+          "rhs_contracting_dimensions":["0"]
+        },
+        "epilogue":"BIAS_RELU"
+      }
+    }
+  ROOT %get-tuple-element = f32[4,4]{1,0} get-tuple-element(%custom-call.1), index=0
+})hlo";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> hlo_module,
+                       ParseAndReturnVerifiedModule(kBiasReluHlo));
+
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<CodegenBackend::EstimatedConfig> estimated_configs,
+      backend_.GetSupportedConfigsWithEstimates(
+          *hlo_module->entry_computation()->root_instruction()->operand(0)));
+  ASSERT_THAT(estimated_configs, Not(IsEmpty()));
+  const bool is_at_least_blackwell = stream_executor_->GetDeviceDescription()
+                                         .cuda_compute_capability()
+                                         .IsAtLeastBlackwell();
+  for (const CodegenBackend::EstimatedConfig& config : estimated_configs) {
+    if (is_at_least_blackwell) {
+      EXPECT_THAT(
+          config.estimated_runtime,
+          Optional(AllOf(Gt(absl::ZeroDuration()), Lt(absl::Microseconds(5)))));
+    } else {
+      EXPECT_THAT(config.estimated_runtime,
+                  Optional(Gt(absl::Microseconds(5))));
+    }
+  }
+}
+
+TEST_F(CublasLtBackendTest, ScalesLargeGemmOnlyWhenMinDimAtLeast128) {
+  constexpr absl::string_view kUnscaledHlo = R"hlo(
+HloModule module
+
+ENTRY main {
+  p0 = f32[120,4096] parameter(0)
+  p1 = f32[4096,4096] parameter(1)
+  %gemm = (f32[120,4096]{1,0}, s8[4194304]{0}) custom-call(p0, p1),
+    custom_call_target="__cublas$lt$matmul",
+    backend_config={
+      "gemm_backend_config":{
+        "alpha_real":1,
+        "dot_dimension_numbers":{
+          "lhs_contracting_dimensions":["1"],
+          "rhs_contracting_dimensions":["0"]
+        }
+      }
+    }
+  ROOT %gte = f32[120,4096]{1,0} get-tuple-element(%gemm), index=0
+})hlo";
+  constexpr absl::string_view kScaledHlo = R"hlo(
+HloModule module
+
+ENTRY main {
+  p0 = f32[128,4096] parameter(0)
+  p1 = f32[4096,4096] parameter(1)
+  %gemm = (f32[128,4096]{1,0}, s8[4194304]{0}) custom-call(p0, p1),
+    custom_call_target="__cublas$lt$matmul",
+    backend_config={
+      "gemm_backend_config":{
+        "alpha_real":1,
+        "dot_dimension_numbers":{
+          "lhs_contracting_dimensions":["1"],
+          "rhs_contracting_dimensions":["0"]
+        }
+      }
+    }
+  ROOT %gte = f32[128,4096]{1,0} get-tuple-element(%gemm), index=0
+})hlo";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> unscaled_module,
+                       ParseAndReturnVerifiedModule(kUnscaledHlo));
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<CodegenBackend::EstimatedConfig> unscaled_configs,
+      backend_.GetSupportedConfigsWithEstimates(
+          *unscaled_module->entry_computation()->root_instruction()->operand(
+              0)));
+  ASSERT_THAT(unscaled_configs, Not(IsEmpty()));
+  ASSERT_TRUE(unscaled_configs[0].estimated_runtime.has_value());
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<HloModule> scaled_module,
+                       ParseAndReturnVerifiedModule(kScaledHlo));
+  ASSERT_OK_AND_ASSIGN(
+      std::vector<CodegenBackend::EstimatedConfig> scaled_configs,
+      backend_.GetSupportedConfigsWithEstimates(
+          *scaled_module->entry_computation()->root_instruction()->operand(0)));
+  ASSERT_THAT(scaled_configs, Not(IsEmpty()));
+  ASSERT_TRUE(scaled_configs[0].estimated_runtime.has_value());
+
+  EXPECT_LT(*scaled_configs[0].estimated_runtime,
+            *unscaled_configs[0].estimated_runtime);
 }
 
 }  // namespace
