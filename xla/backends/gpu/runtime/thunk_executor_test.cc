@@ -39,6 +39,7 @@ limitations under the License.
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/platform_util.h"
+#include "xla/service/service_executable_run_options.h"
 #include "xla/service/shaped_slice.h"
 #include "xla/shape.h"
 #include "xla/stream_executor/device_address.h"
@@ -317,6 +318,105 @@ TEST(SequentialThunkProgressTrackerTest, TrackWhileLoopNest) {
     EXPECT_EQ(thunk.loop_nest[0], WhileLoopState({"while_loop", kTripCount, 0,
                                                   kTripCount - 1 - i}));
   }
+}
+
+class FakeCommandBufferThunk : public Thunk {
+ public:
+  FakeCommandBufferThunk(ThunkInfo thunk_info,
+                         std::unique_ptr<SequentialThunk> thunks)
+      : Thunk(Kind::kCommandBuffer, std::move(thunk_info)),
+        thunks_(std::move(thunks)) {}
+
+  absl::Status ExecuteOnStream(const ExecuteParams& params) override {
+    return absl::OkStatus();
+  }
+
+  BufferUses buffer_uses() const override { return {}; }
+
+  absl::Status WalkNested(Walker pre_order, Walker post_order) override {
+    if (thunks_ != nullptr) {
+      return thunks_->Walk(pre_order, post_order);
+    }
+    return absl::OkStatus();
+  }
+
+  absl::StatusOr<ThunkProto> ToProto() const override {
+    return absl::UnimplementedError("Not implemented");
+  }
+
+ private:
+  std::unique_ptr<SequentialThunk> thunks_;
+};
+
+TEST(SequentialThunkProgressTrackerTest, TrackCommandBufferNestedThunks) {
+  using ::testing::ElementsAre;
+  using ::testing::IsEmpty;
+
+  ASSERT_OK_AND_ASSIGN(se::StreamExecutor * stream_executor, GpuExecutor());
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<se::Stream> stream,
+                       stream_executor->CreateStream());
+
+  BufferAllocation alloc(/*index=*/0, /*size=*/8, /*color=*/0);
+  BufferAllocation::Slice slice0(&alloc, 0, 4);
+  BufferAllocation::Slice slice1(&alloc, 4, 4);
+  Shape shape = ShapeUtil::MakeShape(S32, {1});
+
+  ServiceExecutableRunOptions run_options;
+  se::StreamExecutorAddressAllocator allocator(stream_executor);
+  se::DeviceAddress<int32_t> storage =
+      stream_executor->AllocateArray<int32_t>(2, 0);
+  BufferAllocations allocations({storage}, 0, &allocator);
+  Thunk::ExecuteParams params =
+      Thunk::ExecuteParams::Create(run_options, allocations, stream.get(),
+                                   stream.get(), nullptr, nullptr, nullptr);
+
+  // Build a 2-level hierarchy inside the command buffer: an outer unnamed
+  // SequentialThunk (which should be filtered out of nested_thunks) containing
+  // a leaf MemzeroThunk and a named SequentialThunk (which should be retained)
+  // wrapping a second MemzeroThunk.
+  ThunkSequence deep_thunks;
+  deep_thunks.Emplace<MemzeroThunk>(ThunkInfo("inner_op_1"),
+                                    ShapedSlice{slice1, shape});
+  auto named_seq = std::make_unique<SequentialThunk>(
+      ThunkInfo("named_sub_sequence"), std::move(deep_thunks));
+
+  ThunkSequence inner_thunks;
+  inner_thunks.Emplace<MemzeroThunk>(ThunkInfo("inner_op_0"),
+                                     ShapedSlice{slice0, shape});
+  inner_thunks.push_back(std::move(named_seq));
+  auto seq_thunk = std::make_unique<SequentialThunk>(Thunk::ThunkInfo(),
+                                                     std::move(inner_thunks));
+
+  ThunkSequence outer_sequence;
+  outer_sequence.Emplace<FakeCommandBufferThunk>(ThunkInfo("empty_cmd_buf"),
+                                                 /*thunks=*/nullptr);
+  outer_sequence.Emplace<FakeCommandBufferThunk>(ThunkInfo("command_buffer_10"),
+                                                 std::move(seq_thunk));
+
+  ThunkExecutor executor(std::move(outer_sequence));
+  ASSERT_OK_AND_ASSIGN(ThunkExecutor::ScopedProgressTracker tracker,
+                       InstallProgressTracker(stream_executor, executor));
+
+  ASSERT_OK(executor.ExecuteOnStream(params));
+  ASSERT_OK(stream->BlockHostUntilDone());
+
+  std::vector<ThunkExecutor::ProgressTracker::ThunkExecution> completed =
+      tracker.LastCompletedThunks(2);
+  ASSERT_EQ(completed.size(), 2);
+  EXPECT_EQ(completed[0].name, "command_buffer_10");
+  EXPECT_EQ(completed[0].kind, Thunk::kCommandBuffer);
+  EXPECT_THAT(completed[0].nested_thunks,
+              ElementsAre(
+                  ThunkExecutor::ProgressTracker::NestedThunk{
+                      3, Thunk::kMemzero, "inner_op_0"},
+                  ThunkExecutor::ProgressTracker::NestedThunk{
+                      4, Thunk::kSequential, "named_sub_sequence"},
+                  ThunkExecutor::ProgressTracker::NestedThunk{
+                      5, Thunk::kMemzero, "inner_op_1"}));
+
+  EXPECT_EQ(completed[1].name, "empty_cmd_buf");
+  EXPECT_EQ(completed[1].kind, Thunk::kCommandBuffer);
+  EXPECT_THAT(completed[1].nested_thunks, IsEmpty());
 }
 
 }  // namespace

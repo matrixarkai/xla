@@ -587,5 +587,38 @@ TEST(DebugOptions, ResetFlagValuesPreservesCudaDataDirFromEnv) {
   ResetFlagValues();
   ParseDebugOptionFlagsFromEnv(/*reset_envvar=*/true);
 }
+
+TEST(DebugOptions, ExecutionWarnStuckTimeoutFlagsParsing) {
+  DebugOptions opts = DefaultDebugOptionsIgnoringFlags();
+  EXPECT_EQ(opts.xla_gpu_execution_warn_stuck_timeout(), "");
+  EXPECT_EQ(opts.xla_gpu_device_execution_warn_stuck_timeout(), "");
+
+  std::vector<tsl::Flag> flags;
+  MakeDebugOptionsFlags(&flags, &opts);
+  std::vector<std::string> flag_args = {
+      "--xla_gpu_execution_warn_stuck_timeout=15s",
+      "--xla_gpu_device_execution_warn_stuck_timeout=30s"};
+  EXPECT_TRUE(tsl::Flags::Parse(flag_args, flags));
+  EXPECT_EQ(opts.xla_gpu_execution_warn_stuck_timeout(), "15s");
+  EXPECT_EQ(opts.xla_gpu_device_execution_warn_stuck_timeout(), "30s");
+
+  std::vector<std::string> inf_args = {
+      "--xla_gpu_execution_warn_stuck_timeout=inf",
+      "--xla_gpu_device_execution_warn_stuck_timeout=inf"};
+  EXPECT_TRUE(tsl::Flags::Parse(inf_args, flags));
+  EXPECT_EQ(opts.xla_gpu_execution_warn_stuck_timeout(), "inf");
+  EXPECT_EQ(opts.xla_gpu_device_execution_warn_stuck_timeout(), "inf");
+
+  std::vector<std::string> empty_args = {
+      "--xla_gpu_execution_warn_stuck_timeout=",
+      "--xla_gpu_device_execution_warn_stuck_timeout="};
+  EXPECT_TRUE(tsl::Flags::Parse(empty_args, flags));
+  EXPECT_EQ(opts.xla_gpu_execution_warn_stuck_timeout(), "");
+  EXPECT_EQ(opts.xla_gpu_device_execution_warn_stuck_timeout(), "");
+
+  std::vector<std::string> invalid_args = {
+      "--xla_gpu_device_execution_warn_stuck_timeout=not_a_duration"};
+  EXPECT_FALSE(tsl::Flags::Parse(invalid_args, flags));
+}
 }  // namespace
 }  // namespace xla
