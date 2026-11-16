@@ -1830,10 +1830,16 @@ cc_library(
     srcs = ["gpu_pipeline.cc"],
     hdrs = ["gpu_pipeline.h"],
     deps = [
+        "//xla:xla_proto_cc",
+        "//xla/hlo/pass:hlo_pass_context",
         "//xla/hlo/pass:hlo_pass_options",
         "//xla/hlo/pass:hlo_pipeline_editor",
         "//xla/hlo/pass:hlo_pipeline_proto_cc",
         "//xla/hlo/transforms/simplifiers:algebraic_simplifier",
+        "//xla/service:hlo_module_config",
+        "//xla/stream_executor:device_description",
+        "@com_google_absl//absl/status:status_macros",
+        "@com_google_absl//absl/status:statusor",
     ],
 )
 
@@ -1863,17 +1869,23 @@ xla_cc_test(
     deps = [
         ":gpu_device_info_for_tests",
         ":gpu_pipeline",
-        ":gpu_pipeline_passes",  # keep
+        ":gpu_pipeline_passes",  # keep -- buildcleaner: keep: links HloPassRegistry factories
+        "//xla:xla_proto_cc",
         "//xla/core/host_offloading:hlo_host_device_type_call_wrapper",
         "//xla/hlo/ir:hlo",
         "//xla/hlo/pass:hlo_pass_context",
         "//xla/hlo/pass:hlo_pass_options",
         "//xla/hlo/pass:hlo_pass_registry",
         "//xla/hlo/pass:hlo_pipeline_proto_cc",
+        "//xla/hlo/testlib:hlo_hardware_independent_test_base",
+        "//xla/hlo/testlib:pattern_matcher_gmock",
         "//xla/hlo/transforms/simplifiers:algebraic_simplifier",
+        "//xla/service:hlo_module_config",
+        "//xla/service:pattern_matcher",
         "//xla/stream_executor:device_description",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_googletest//:gtest_main",
     ],
 )
@@ -2556,6 +2568,7 @@ cc_library(
     deps = [
         ":alias_info",
         ":gpu_compiler",
+        ":gpu_pipeline",
         ":ir_emission_utils",
         ":metrics",
         ":nvptx_alias_info",
@@ -2884,6 +2897,7 @@ cc_library(
     deps = [
         ":alias_info",
         ":gpu_compiler",
+        ":gpu_pipeline",
         ":target_constants",
         "//xla:util",
         "//xla:xla_data_proto_cc",
@@ -3989,6 +4003,7 @@ cc_library(
     ]),
     deps = [
         ":gpu_compiler",
+        ":gpu_pipeline",
         ":target_constants",
         "//xla/backends/gpu/transforms:algebraic_simplifier",
         "//xla/backends/gpu/transforms:conv_padding_legalization",
