@@ -26,6 +26,7 @@ limitations under the License.
 #include <ostream>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -54,6 +55,7 @@ limitations under the License.
 #include "xla/shape_tree.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
+#include "xla/tsl/lib/core/bitmap.h"
 #include "xla/tsl/platform/errors.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
@@ -194,6 +196,27 @@ std::vector<AxisRef> GetOrderedAxisRefs(const NamedSharding& sharding) {
     }
   }
   return axis_refs;
+}
+
+// Verifies that `elements` is a permutation of `[0, elements.size())`.
+template <typename IntT>
+absl::Status ValidatePermutation(absl::Span<const IntT> elements,
+                                 absl::string_view element_name) {
+  static_assert(std::is_signed_v<IntT>);
+  const int64_t n = elements.size();
+  tsl::core::Bitmap seen(n);
+  for (const IntT element : elements) {
+    if (element < 0 || element >= n) {
+      return absl::InvalidArgumentError(
+          absl::StrCat(element_name, " ", element, " must be in [0, ", n, ")"));
+    }
+    if (seen.get(element)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat(element_name, " ", element, " must be unique"));
+    }
+    seen.set(element);
+  }
+  return absl::OkStatus();
 }
 
 }  // namespace
@@ -1126,6 +1149,9 @@ const TileAssignment& HloSharding::TileAgnosticDeviceAssignment() const {
     TF_RET_CHECK(proto.tile_assignment_devices().empty());
     TF_RET_CHECK(proto.iota_reshape_dims().size() ==
                  proto.iota_transpose_perm().size());
+    ABSL_RETURN_IF_ERROR(
+        ValidatePermutation(absl::MakeConstSpan(proto.iota_transpose_perm()),
+                            "iota_transpose_perm index"));
   } else {
     TF_RET_CHECK(!proto.tile_assignment_devices().empty());
   }
@@ -1170,6 +1196,9 @@ const TileAssignment& HloSharding::TileAgnosticDeviceAssignment() const {
   } else {
     TF_RET_CHECK(product_of_dimensions ==
                  proto.tile_assignment_devices().size());
+    // Each device in [0, product_of_dimensions) must be assigned to one tile.
+    ABSL_RETURN_IF_ERROR(ValidatePermutation(
+        absl::MakeConstSpan(proto.tile_assignment_devices()), "device"));
   }
 
   auto create_tile_assignment = [&] {

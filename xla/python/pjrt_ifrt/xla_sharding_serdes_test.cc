@@ -21,6 +21,7 @@ limitations under the License.
 #include <utility>
 
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_sharding.h"
@@ -34,8 +35,8 @@ limitations under the License.
 #include "xla/python/ifrt/sharding.h"
 #include "xla/python/pjrt_ifrt/xla_sharding.h"
 #include "xla/python/pjrt_ifrt/xla_sharding.pb.h"
-#include "xla/tsl/platform/status_matchers.h"
 #include "xla/tsl/platform/statusor.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace ifrt {
@@ -43,7 +44,6 @@ namespace {
 
 using ::testing::ElementsAreArray;
 using ::testing::HasSubstr;
-using ::tsl::testing::StatusIs;
 
 using XlaShardingSerDesTestParam =
     std::tuple<SerDesVersion, test_util::DeviceTestParam>;
@@ -100,6 +100,102 @@ TEST_P(XlaShardingSerDesTest, RejectHloShardingV3Serialization) {
           absl::StatusCode::kInvalidArgument,
           HasSubstr(
               "XLA HloShardingV3 format is not supported for serialization")));
+}
+
+TEST_P(XlaShardingSerDesTest, RejectHloShardingV3Deserialization) {
+  DeviceListRef device_list = GetDevices({0, 1});
+  xla::HloSharding xla_hlo_sharding = xla::HloSharding::IotaTile({2, 1});
+  std::unique_ptr<HloSharding> sharding = HloSharding::Create(
+      device_list, MemoryKind("abc"), /*xla_hlo_sharding=*/xla_hlo_sharding);
+  ASSERT_OK_AND_ASSIGN(
+      auto serialized,
+      Serialize(*sharding, std::make_unique<SerializeOptions>(version())));
+
+  HloShardingProto proto;
+  ASSERT_TRUE(proto.ParseFromString(serialized.data()));
+  xla::OpSharding v3_op_sharding =
+      xla::HloSharding::ToV3Sharding(xla_hlo_sharding).ToProto();
+  *proto.mutable_xla_op_sharding() = v3_op_sharding;
+  serialized.set_data(proto.SerializeAsCord());
+
+  EXPECT_THAT(
+      Deserialize<HloSharding>(
+          serialized, std::make_unique<DeserializeShardingOptions>(client())),
+      absl_testing::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          HasSubstr("XLA HloShardingV3 format is not supported for "
+                    "deserialization")));
+
+  // Also reject V3 shardings nested inside a tuple OpSharding.
+  xla::OpSharding* tuple_op_sharding = proto.mutable_xla_op_sharding();
+  tuple_op_sharding->Clear();
+  tuple_op_sharding->set_type(xla::OpSharding::TUPLE);
+  *tuple_op_sharding->add_tuple_shardings() = v3_op_sharding;
+  serialized.set_data(proto.SerializeAsCord());
+
+  EXPECT_THAT(
+      Deserialize<HloSharding>(
+          serialized, std::make_unique<DeserializeShardingOptions>(client())),
+      absl_testing::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          HasSubstr("XLA HloShardingV3 format is not supported for "
+                    "deserialization")));
+}
+
+TEST_P(XlaShardingSerDesTest, RejectDuplicateDevicesInTileAssignment) {
+  DeviceListRef device_list = GetDevices({0, 1});
+  xla::HloSharding xla_hlo_sharding =
+      xla::HloSharding::Tile(xla::TileAssignment({2, 1}));
+  std::unique_ptr<HloSharding> sharding = HloSharding::Create(
+      device_list, MemoryKind("abc"), /*xla_hlo_sharding=*/xla_hlo_sharding);
+  ASSERT_OK_AND_ASSIGN(
+      auto serialized,
+      Serialize(*sharding, std::make_unique<SerializeOptions>(version())));
+
+  // Assign both tiles to device 0, leaving device 1 without a tile.
+  HloShardingProto proto;
+  ASSERT_TRUE(proto.ParseFromString(serialized.data()));
+  xla::OpSharding* op_sharding = proto.mutable_xla_op_sharding();
+  op_sharding->clear_iota_reshape_dims();
+  op_sharding->clear_iota_transpose_perm();
+  op_sharding->add_tile_assignment_devices(0);
+  op_sharding->add_tile_assignment_devices(0);
+  serialized.set_data(proto.SerializeAsCord());
+
+  EXPECT_THAT(
+      Deserialize<HloSharding>(
+          serialized, std::make_unique<DeserializeShardingOptions>(client())),
+      absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                             HasSubstr("device 0 must be unique")));
+}
+
+TEST_P(XlaShardingSerDesTest, RejectInvalidIotaTransposePerm) {
+  DeviceListRef device_list = GetDevices({0, 1});
+  xla::HloSharding xla_hlo_sharding =
+      xla::HloSharding::Tile(xla::TileAssignment({2, 1}));
+  std::unique_ptr<HloSharding> sharding = HloSharding::Create(
+      device_list, MemoryKind("abc"), /*xla_hlo_sharding=*/xla_hlo_sharding);
+  ASSERT_OK_AND_ASSIGN(
+      auto serialized,
+      Serialize(*sharding, std::make_unique<SerializeOptions>(version())));
+
+  HloShardingProto proto;
+  ASSERT_TRUE(proto.ParseFromString(serialized.data()));
+  xla::OpSharding* op_sharding = proto.mutable_xla_op_sharding();
+  op_sharding->clear_iota_reshape_dims();
+  op_sharding->clear_iota_transpose_perm();
+  op_sharding->add_iota_reshape_dims(2);
+  op_sharding->add_iota_reshape_dims(1);
+  op_sharding->add_iota_transpose_perm(0);
+  op_sharding->add_iota_transpose_perm(0);
+  serialized.set_data(proto.SerializeAsCord());
+
+  EXPECT_THAT(
+      Deserialize<HloSharding>(
+          serialized, std::make_unique<DeserializeShardingOptions>(client())),
+      absl_testing::StatusIs(
+          absl::StatusCode::kInvalidArgument,
+          HasSubstr("iota_transpose_perm index 0 must be unique")));
 }
 
 INSTANTIATE_TEST_SUITE_P(

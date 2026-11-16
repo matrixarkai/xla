@@ -27,6 +27,7 @@ limitations under the License.
 #include "absl/hash/hash.h"
 #include "absl/hash/hash_testing.h"
 #include "absl/status/status.h"
+#include "absl/status/status_matchers.h"
 #include "absl/types/span.h"
 #include "xla/array.h"
 #include "xla/array3d.h"
@@ -48,6 +49,8 @@ limitations under the License.
 namespace xla {
 namespace {
 
+using ::absl_testing::StatusIs;
+using ::testing::HasSubstr;
 using ::tsl::proto_testing::EqualsProto;
 using ::tsl::proto_testing::ParseTextProtoOrDie;
 
@@ -239,6 +242,79 @@ TEST_F(HloShardingTest, FromProtoFailsWithMoreLastTileDimsThanTileDims) {
   )pb");
   EXPECT_THAT(HloSharding::FromProto(proto).status().message(),
               ::testing::HasSubstr("last_tile_dims has 2 entries"));
+}
+
+TEST_F(HloShardingTest, FromProtoFailsWithDuplicateDeviceInTileAssignment) {
+  auto proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+    type: OTHER
+    tile_assignment_dimensions: 3
+    tile_assignment_devices: 0
+    tile_assignment_devices: 0
+    tile_assignment_devices: 2
+  )pb");
+  EXPECT_THAT(HloSharding::FromProto(proto),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("device 0 must be unique")));
+}
+
+TEST_F(HloShardingTest, FromProtoFailsWithOutOfRangeDeviceInTileAssignment) {
+  // The devices must be in [0, 3).
+  auto proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+    type: OTHER
+    tile_assignment_dimensions: 3
+    tile_assignment_devices: 0
+    tile_assignment_devices: 1
+    tile_assignment_devices: 3
+  )pb");
+  EXPECT_THAT(HloSharding::FromProto(proto),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("device 3 must be in [0, 3)")));
+
+  proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+    type: OTHER
+    tile_assignment_dimensions: 3
+    tile_assignment_devices: 0
+    tile_assignment_devices: -1
+    tile_assignment_devices: 2
+  )pb");
+  EXPECT_THAT(HloSharding::FromProto(proto),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("device -1 must be in [0, 3)")));
+}
+
+TEST_F(HloShardingTest, FromProtoFailsWithInvalidIotaTransposePerm) {
+  auto proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+    type: OTHER
+    tile_assignment_dimensions: 8
+    iota_reshape_dims: [ 2, 2, 2 ]
+    iota_transpose_perm: [ 0, 0, 0 ]
+  )pb");
+  EXPECT_THAT(
+      HloSharding::FromProto(proto),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("iota_transpose_perm index 0 must be unique")));
+
+  proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+    type: OTHER
+    tile_assignment_dimensions: 4
+    iota_reshape_dims: [ 2, 2 ]
+    iota_transpose_perm: [ 0, 2 ]
+  )pb");
+  EXPECT_THAT(
+      HloSharding::FromProto(proto),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("iota_transpose_perm index 2 must be in [0, 2)")));
+
+  proto = ParseTextProtoOrDie<OpSharding>(R"pb(
+    type: OTHER
+    tile_assignment_dimensions: 4
+    iota_reshape_dims: [ 2, 2 ]
+    iota_transpose_perm: [ -1, 1 ]
+  )pb");
+  EXPECT_THAT(
+      HloSharding::FromProto(proto),
+      StatusIs(absl::StatusCode::kInvalidArgument,
+               HasSubstr("iota_transpose_perm index -1 must be in [0, 2)")));
 }
 
 using TileTest = HloShardingTest;

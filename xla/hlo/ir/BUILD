@@ -284,6 +284,7 @@ cc_library(
         "//xla:status_macros",
         "//xla:util",
         "//xla:xla_data_proto_cc",
+        "//xla/tsl/lib/core:bitmap",
         "//xla/tsl/platform:errors",
         "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/base:core_headers",
