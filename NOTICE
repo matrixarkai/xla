@@ -1,0 +1,10 @@
+OpenXLA
+
+This repository distributes XLA under the Apache License, Version 2.0.
+The full license is in LICENSE.
+
+Upstream project: https://github.com/openxla/xla
+
+Copyright and attribution notices in individual files and third-party license
+files remain applicable and must be preserved when required by their licenses.
+This notice is informational and does not change the applicable license terms.
